@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -67,6 +68,73 @@ async def build_openai_mcp_tool(server: MCPServer) -> tuple[dict[str, Any], dict
     return tool, token_meta
 
 
+def _session_header_name(headers: httpx.Headers) -> str | None:
+    for key in headers.keys():
+        if key.lower() == "mcp-session-id":
+            return key
+    return None
+
+
+def _extract_json_payload(response: httpx.Response) -> dict[str, Any]:
+    content_type = response.headers.get("content-type", "")
+    if "application/json" in content_type:
+        return response.json()
+
+    text = response.text.strip()
+    if text.startswith("data:"):
+        payload_lines = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
+        if payload_lines:
+            return json.loads("".join(payload_lines))
+    return response.json()
+
+
+async def discover_mcp_tools(server: MCPServer) -> tuple[list[str], dict[str, Any]]:
+    token, token_meta = await fetch_access_token(server)
+    timeout = httpx.Timeout(server.timeout_ms / 1000)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        **(server.headers or {}),
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        initialize_response = await client.post(
+            server.server_url,
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": "initialize",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "agent-playground", "version": "0.1.0"},
+                },
+            },
+        )
+        initialize_response.raise_for_status()
+        session_header = _session_header_name(initialize_response.headers)
+        session_value = initialize_response.headers.get(session_header) if session_header else None
+        session_headers = headers | ({session_header: session_value} if session_header and session_value else {})
+
+        await client.post(
+            server.server_url,
+            headers=session_headers,
+            json={"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        )
+
+        tools_response = await client.post(
+            server.server_url,
+            headers=session_headers,
+            json={"jsonrpc": "2.0", "id": "tools-list", "method": "tools/list", "params": {}},
+        )
+        tools_response.raise_for_status()
+        payload = _extract_json_payload(tools_response)
+        tools = payload.get("result", {}).get("tools", [])
+        tool_names = [tool.get("name", "unknown") for tool in tools if isinstance(tool, dict)]
+        return tool_names, token_meta
+
+
 def serialize_mcp_server(server: MCPServer) -> dict[str, Any]:
     return {
         "id": server.id,
@@ -85,4 +153,3 @@ def serialize_mcp_server(server: MCPServer) -> dict[str, Any]:
 
 def prompt_mode_servers(db: Session) -> list[MCPServer]:
     return list(db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "prompt"))
-

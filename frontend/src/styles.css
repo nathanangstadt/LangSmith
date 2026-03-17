@@ -236,6 +236,32 @@ button.list-item {
   padding-top: 0.15rem;
 }
 
+.mcp-tools-panel {
+  display: grid;
+  gap: 0.45rem;
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border-radius: 16px;
+  background: rgba(243, 247, 251, 0.95);
+  border: 1px solid rgba(25, 33, 38, 0.1);
+}
+
+.mcp-tools-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.mcp-tool-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.35rem 0.6rem;
+  border-radius: 999px;
+  background: #e8f2ff;
+  color: #24415f;
+  font-size: 0.82rem;
+}
+
 .toggle-row {
   display: flex;
   align-items: center;

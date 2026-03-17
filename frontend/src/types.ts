@@ -32,6 +32,11 @@ export type MCPServer = {
   enabled: boolean;
 };
 
+export type MCPServerDetail = MCPServer & {
+  client_id: string;
+  client_secret: string;
+};
+
 export type Message = {
   id: string;
   thread_id: string;
@@ -98,4 +103,3 @@ export type PendingApproval = {
   mcp_server_id: string;
   metadata: Record<string, unknown>;
 };
-

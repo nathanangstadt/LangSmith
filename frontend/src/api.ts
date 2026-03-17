@@ -1,4 +1,4 @@
-import type { AgentProfile, MCPServer, RunTelemetry, Thread } from "./types";
+import type { AgentProfile, MCPServer, MCPServerDetail, RunTelemetry, Thread } from "./types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8001";
 
@@ -31,6 +31,7 @@ export const api = {
   exportAgentMd: (profileId: string) =>
     request<string>(`/agent-profiles/${profileId}/export-agent-md`, { headers: {} }),
   listServers: () => request<MCPServer[]>("/mcp-servers"),
+  getServer: (serverId: string) => request<MCPServerDetail>(`/mcp-servers/${serverId}`),
   createServer: (body: Record<string, unknown>) =>
     request<MCPServer>("/mcp-servers", { method: "POST", body: JSON.stringify(body) }),
   updateServer: (serverId: string, body: Record<string, unknown>) =>

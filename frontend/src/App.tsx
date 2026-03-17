@@ -30,7 +30,7 @@ const defaultMcpForm = {
   client_id: "",
   client_secret: "",
   scope: "",
-  allowed_tools: "search_docs,get_doc",
+  allowed_tools: "",
   approval_mode: "prompt",
   headers: "{}",
   timeout_ms: 20000,
@@ -42,6 +42,7 @@ type MpcFormState = typeof defaultMcpForm;
 type ServerTestState = {
   status: "idle" | "success" | "error";
   message: string;
+  tools: string[];
 };
 
 export default function App() {
@@ -60,7 +61,7 @@ export default function App() {
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
   const [statusLine, setStatusLine] = useState("Idle");
   const [errorMessage, setErrorMessage] = useState("");
-  const [serverTestState, setServerTestState] = useState<ServerTestState>({ status: "idle", message: "" });
+  const [serverTestState, setServerTestState] = useState<ServerTestState>({ status: "idle", message: "", tools: [] });
 
   useEffect(() => {
     void initializeWorkspace();
@@ -156,7 +157,7 @@ export default function App() {
       return;
     }
     if (!selectedServerId || !servers.some((server) => server.id === selectedServerId)) {
-      onSelectServer(servers[0]);
+      void onSelectServer(servers[0]);
     }
   }, [servers, selectedServerId, isCreatingServer]);
 
@@ -288,7 +289,7 @@ export default function App() {
   const onMcpField = (key: string, value: string | number | boolean) => {
     setMcpForm((current) => ({ ...current, [key]: value }));
     if (serverTestState.status !== "idle") {
-      setServerTestState({ status: "idle", message: "" });
+      setServerTestState({ status: "idle", message: "", tools: [] });
     }
   };
 
@@ -320,26 +321,34 @@ export default function App() {
 
   const buildServerTestMessage = (result: Record<string, unknown>, label: string) => {
     const tokenMeta = (result.token_meta as Record<string, unknown> | undefined) ?? {};
-    const tool = (result.tool as Record<string, unknown> | undefined) ?? {};
     const cacheState = String(tokenMeta.cache ?? "ok");
     const expiresIn = tokenMeta.expires_in ? `, expires in ${tokenMeta.expires_in}s` : "";
-    const mode = String(tool.require_approval ?? "never");
-    return `${label} passed (${cacheState}${expiresIn}). Approval: ${mode}.`;
+    return `${label} passed (${cacheState}${expiresIn}).`;
   };
 
-  const onSelectServer = (server: MCPServer) => {
-    setIsCreatingServer(false);
-    setSelectedServerId(server.id);
-    setMcpForm(serverToForm(server));
-    setServerTestState({ status: "idle", message: "" });
-    setStatusLine(`Selected ${server.label}`);
+  const onSelectServer = async (server: MCPServer) => {
+    setErrorMessage("");
+    try {
+      const detail = await api.getServer(server.id);
+      setIsCreatingServer(false);
+      setSelectedServerId(server.id);
+      setMcpForm({
+        ...serverToForm(server),
+        client_id: detail.client_id,
+        client_secret: detail.client_secret,
+      });
+      setServerTestState({ status: "idle", message: "", tools: [] });
+      setStatusLine(`Selected ${server.label}`);
+    } catch (error) {
+      handleError(error, `Unable to load ${server.label}`);
+    }
   };
 
   const onResetServerForm = () => {
     setIsCreatingServer(true);
     setSelectedServerId("");
     setMcpForm(defaultMcpForm);
-    setServerTestState({ status: "idle", message: "" });
+    setServerTestState({ status: "idle", message: "", tools: [] });
     setStatusLine("Ready to add an MCP server");
   };
 
@@ -354,10 +363,7 @@ export default function App() {
             token_url: payload.token_url,
             grant_type: payload.grant_type,
             scope: payload.scope,
-            allowed_tools: payload.allowed_tools,
             approval_mode: payload.approval_mode,
-            headers: payload.headers,
-            timeout_ms: payload.timeout_ms,
             enabled: payload.enabled,
             ...(mcpForm.client_id ? { client_id: mcpForm.client_id } : {}),
             ...(mcpForm.client_secret ? { client_secret: mcpForm.client_secret } : {}),
@@ -365,9 +371,14 @@ export default function App() {
         : await api.createServer(payload);
       setIsCreatingServer(false);
       setSelectedServerId(saved.id);
-      setMcpForm(serverToForm(saved));
+      const detail = await api.getServer(saved.id);
+      setMcpForm({
+        ...serverToForm(saved),
+        client_id: detail.client_id,
+        client_secret: detail.client_secret,
+      });
       setStatusLine(`${selectedServerId ? "Updated" : "Saved"} MCP server ${saved.label}`);
-      setServerTestState({ status: "idle", message: "" });
+      setServerTestState({ status: "idle", message: "", tools: [] });
       await refreshAll();
     } catch (error) {
       handleError(error, "Unable to save the MCP server");
@@ -380,7 +391,10 @@ export default function App() {
       const result = await api.testDraftServer(serializeDraftServer(mcpForm));
       const label = selectedServerId ? mcpForm.label || mcpForm.name : `Draft ${mcpForm.label || mcpForm.name}`;
       const message = buildServerTestMessage(result, label);
-      setServerTestState({ status: "success", message });
+      const tools = Array.isArray(result.discovered_tools)
+        ? result.discovered_tools.map((tool) => String(tool))
+        : [];
+      setServerTestState({ status: "success", message, tools });
       setStatusLine("MCP configuration passed");
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : "Unable to test the draft MCP server";
@@ -391,7 +405,7 @@ export default function App() {
       } catch {
         message = rawMessage;
       }
-      setServerTestState({ status: "error", message });
+      setServerTestState({ status: "error", message, tools: [] });
       setErrorMessage(message);
       setStatusLine("MCP test failed");
     }
@@ -556,7 +570,7 @@ export default function App() {
                 <button
                   key={server.id}
                   className={server.id === selectedServerId ? "mcp-server-item selected" : "mcp-server-item"}
-                  onClick={() => onSelectServer(server)}
+                  onClick={() => void onSelectServer(server)}
                 >
                   <span className="mcp-server-item-title">{server.label}</span>
                   <span className="mcp-server-item-meta">
@@ -583,43 +597,45 @@ export default function App() {
                   onChange={(e) => onMcpField("enabled", e.target.checked)}
                 />
               </div>
-          <label>Name</label>
-          <input value={mcpForm.name} onChange={(e) => onMcpField("name", e.target.value)} />
-          <label>Label</label>
-          <input value={mcpForm.label} onChange={(e) => onMcpField("label", e.target.value)} />
-          <label>Server URL</label>
-          <input value={mcpForm.server_url} onChange={(e) => onMcpField("server_url", e.target.value)} />
-          <label>Token URL</label>
-          <input value={mcpForm.token_url} onChange={(e) => onMcpField("token_url", e.target.value)} />
-          <label>Client ID</label>
-          <input value={mcpForm.client_id} onChange={(e) => onMcpField("client_id", e.target.value)} />
-          <label>Client Secret</label>
-          <input type="password" value={mcpForm.client_secret} onChange={(e) => onMcpField("client_secret", e.target.value)} />
-          {selectedServerId && <p className="helper-text">Leave client ID and client secret blank to keep the saved credentials for test and save.</p>}
-          <label>Scope</label>
-          <input value={mcpForm.scope} onChange={(e) => onMcpField("scope", e.target.value)} />
-          <label>Allowed Tools</label>
-          <input value={mcpForm.allowed_tools} onChange={(e) => onMcpField("allowed_tools", e.target.value)} />
-          <label>Approval</label>
-          <select value={mcpForm.approval_mode} onChange={(e) => onMcpField("approval_mode", e.target.value)}>
-            <option value="prompt">prompt</option>
-            <option value="auto">auto</option>
-          </select>
-          <label>Headers JSON</label>
-          <textarea value={mcpForm.headers} onChange={(e) => onMcpField("headers", e.target.value)} rows={3} />
-          <label>Timeout (ms)</label>
-          <input
-            type="number"
-            min={1000}
-            value={mcpForm.timeout_ms}
-            onChange={(e) => onMcpField("timeout_ms", Number(e.target.value))}
-          />
+              <label>Name</label>
+              <input value={mcpForm.name} onChange={(e) => onMcpField("name", e.target.value)} />
+              <label>Label</label>
+              <input value={mcpForm.label} onChange={(e) => onMcpField("label", e.target.value)} />
+              <label>Server URL</label>
+              <input value={mcpForm.server_url} onChange={(e) => onMcpField("server_url", e.target.value)} />
+              <label>Token URL</label>
+              <input value={mcpForm.token_url} onChange={(e) => onMcpField("token_url", e.target.value)} />
+              <label>Client ID</label>
+              <input value={mcpForm.client_id} onChange={(e) => onMcpField("client_id", e.target.value)} />
+              <label>Client Secret</label>
+              <input type="password" value={mcpForm.client_secret} onChange={(e) => onMcpField("client_secret", e.target.value)} />
+              <label>Scope</label>
+              <input value={mcpForm.scope} onChange={(e) => onMcpField("scope", e.target.value)} />
+              <label>Approval</label>
+              <select value={mcpForm.approval_mode} onChange={(e) => onMcpField("approval_mode", e.target.value)}>
+                <option value="prompt">prompt</option>
+                <option value="auto">auto</option>
+              </select>
               <div className="row-actions">
                 <button className="secondary-button" onClick={() => void onTestDraftServer()}>Test</button>
                 <button onClick={onCreateServer}>{selectedServerId ? "Save Changes" : "Save Server"}</button>
               </div>
-          {serverTestState.status === "success" && <p className="result-banner">{serverTestState.message}</p>}
-          {serverTestState.status === "error" && <p className="error-banner">{serverTestState.message}</p>}
+              {serverTestState.status === "success" && <p className="result-banner">{serverTestState.message}</p>}
+              {serverTestState.status === "error" && <p className="error-banner">{serverTestState.message}</p>}
+              {serverTestState.status === "success" && (
+                <div className="mcp-tools-panel">
+                  <strong>Discovered Tools</strong>
+                  {serverTestState.tools.length > 0 ? (
+                    <div className="mcp-tools-list">
+                      {serverTestState.tools.map((tool) => (
+                        <span key={tool} className="mcp-tool-chip">{tool}</span>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="helper-text">No tools were returned by the server.</p>
+                  )}
+                </div>
+              )}
           </div>
           </div>
         </section>

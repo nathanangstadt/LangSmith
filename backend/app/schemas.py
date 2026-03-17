@@ -152,6 +152,11 @@ class MCPServerOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class MCPServerDetailOut(MCPServerOut):
+    client_id: str
+    client_secret: str
+
+
 class MessageOut(BaseModel):
     id: str
     thread_id: str

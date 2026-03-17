@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.agent_md import export_agent_md, parse_agent_md
 from app.database import get_db
-from app.mcp import build_openai_mcp_tool, serialize_mcp_server
+from app.mcp import build_openai_mcp_tool, discover_mcp_tools, serialize_mcp_server
 from app.models import (
     AgentProfile,
     AgentRun,
@@ -31,6 +31,7 @@ from app.schemas import (
     ApprovalResolve,
     LLMConnectionCreate,
     MCPServerCreate,
+    MCPServerDetailOut,
     MCPServerOut,
     MCPServerTestRequest,
     MCPServerUpdate,
@@ -49,15 +50,19 @@ router = APIRouter()
 async def _test_server_config(server: MCPServer) -> dict[str, Any]:
     try:
         tool, meta = await build_openai_mcp_tool(server)
+        discovered_tools, _ = await discover_mcp_tools(server)
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text.strip() or str(exc)
         raise HTTPException(status_code=400, detail=f"MCP token request failed: {detail}")
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=400, detail=f"MCP connection failed: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"MCP tool discovery failed: {exc}")
     return {
         "ok": True,
         "tool": tool | {"authorization": "<redacted>"},
         "token_meta": meta,
+        "discovered_tools": discovered_tools,
     }
 
 
@@ -209,6 +214,18 @@ def create_mcp_server(payload: MCPServerCreate, db: Session = Depends(get_db)) -
 def list_mcp_servers(db: Session = Depends(get_db)) -> list[MCPServerOut]:
     servers = db.query(MCPServer).order_by(MCPServer.created_at.desc()).all()
     return [MCPServerOut.model_validate(server) for server in servers]
+
+
+@router.get("/mcp-servers/{server_id}", response_model=MCPServerDetailOut)
+def get_mcp_server(server_id: str, db: Session = Depends(get_db)) -> MCPServerDetailOut:
+    server = db.query(MCPServer).filter(MCPServer.id == server_id).one_or_none()
+    if not server:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    return MCPServerDetailOut(
+        **MCPServerOut.model_validate(server).model_dump(),
+        client_id=secret_box.decrypt(server.client_id_encrypted),
+        client_secret=secret_box.decrypt(server.client_secret_encrypted),
+    )
 
 
 @router.patch("/mcp-servers/{server_id}", response_model=MCPServerOut)
