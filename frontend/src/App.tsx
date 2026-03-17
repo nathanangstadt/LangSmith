@@ -619,7 +619,7 @@ export default function App() {
           {errorMessage && <p className="error-banner">{errorMessage}</p>}
         </section>
 
-        <section className="panel">
+        <section className={openMenu?.section === "profiles" ? "panel has-open-menu" : "panel"}>
           <div className="panel-header">
             <h2>Profiles</h2>
             <button className="icon-button" onClick={onResetProfileForm} aria-label="Add profile">+</button>
@@ -701,7 +701,7 @@ export default function App() {
           )}
         </section>
 
-        <section className="panel">
+        <section className={openMenu?.section === "servers" ? "panel has-open-menu" : "panel"}>
           <div className="panel-header">
             <h2>MCP Servers</h2>
             <button className="icon-button" onClick={onResetServerForm} aria-label="Add MCP server">+</button>
@@ -807,7 +807,7 @@ export default function App() {
       </aside>
 
       <main className="workspace">
-        <section className="chat-pane panel">
+        <section className={openMenu?.section === "threads" ? "chat-pane panel has-open-menu" : "chat-pane panel"}>
           <div className="panel-header">
             <h2>Threads</h2>
             <button className="icon-button" onClick={onCreateThread} aria-label="Add thread">+</button>

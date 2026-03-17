@@ -108,6 +108,7 @@ pre {
 }
 
 .panel {
+  position: relative;
   border: 1px solid rgba(25, 33, 38, 0.12);
   border-radius: 24px;
   padding: 0.85rem;
@@ -116,6 +117,10 @@ pre {
   box-shadow: 0 18px 40px rgba(27, 48, 69, 0.08);
   min-width: 0;
   overflow: visible;
+}
+
+.panel.has-open-menu {
+  z-index: 25;
 }
 
 .panel-header,
@@ -170,8 +175,9 @@ pre {
 }
 
 .entity-row.selected {
-  border-color: #d56a4e;
-  box-shadow: inset 0 0 0 1px rgba(213, 106, 78, 0.35);
+  background: rgba(228, 238, 249, 0.98);
+  border-color: rgba(59, 99, 142, 0.3);
+  box-shadow: 0 8px 18px rgba(37, 66, 98, 0.08);
 }
 
 .entity-main {
