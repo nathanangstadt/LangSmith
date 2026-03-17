@@ -55,6 +55,8 @@ export default function App() {
   const [selectedServerId, setSelectedServerId] = useState<string>("");
   const [isCreatingServer, setIsCreatingServer] = useState(false);
   const [isCreatingProfile, setIsCreatingProfile] = useState(false);
+  const [isProfileEditorOpen, setIsProfileEditorOpen] = useState(false);
+  const [isServerEditorOpen, setIsServerEditorOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<MenuState>(null);
   const [profileForm, setProfileForm] = useState(defaultProfileForm);
   const [mcpForm, setMcpForm] = useState(defaultMcpForm);
@@ -62,6 +64,7 @@ export default function App() {
   const [telemetry, setTelemetry] = useState<RunTelemetry | null>(null);
   const [activeRunId, setActiveRunId] = useState<string>("");
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
+  const [waitingThreadId, setWaitingThreadId] = useState<string>("");
   const [statusLine, setStatusLine] = useState("Idle");
   const [errorMessage, setErrorMessage] = useState("");
   const [serverTestState, setServerTestState] = useState<ServerTestState>({ status: "idle", message: "", tools: [] });
@@ -205,13 +208,30 @@ export default function App() {
     );
   };
 
+  const ensureThreadInState = (threadId: string, agentProfileId: string, title: string) => {
+    setThreads((current) => {
+      if (current.some((thread) => thread.id === threadId)) return current;
+      return [
+        {
+          id: threadId,
+          title,
+          agent_profile_id: agentProfileId,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          messages: [],
+        },
+        ...current,
+      ];
+    });
+  };
+
   const onProfileField = (key: string, value: string | number) => {
     setProfileForm((current) => ({ ...current, [key]: value }));
   };
 
-  const toggleMenu = (section: MenuState["section"], id: string) => {
+  const toggleMenu = (section: "profiles" | "threads" | "servers", id: string) => {
     setOpenMenu((current) => {
-      if (current?.section === section && current.id === id) return null;
+      if (current && current.section === section && current.id === id) return null;
       return { section, id };
     });
   };
@@ -222,14 +242,16 @@ export default function App() {
 
   const onResetProfileForm = () => {
     setIsCreatingProfile(true);
+    setIsProfileEditorOpen(true);
     setSelectedProfileId("");
     setProfileForm(defaultProfileForm);
     closeMenu();
     setStatusLine("Ready to add a profile");
   };
 
-  const onSelectProfile = (profile: AgentProfile) => {
+  const onSelectProfile = (profile: AgentProfile, openEditor = false) => {
     setIsCreatingProfile(false);
+    setIsProfileEditorOpen(openEditor);
     setSelectedProfileId(profile.id);
     closeMenu();
     setStatusLine(`Selected profile ${profile.name}`);
@@ -241,11 +263,13 @@ export default function App() {
       if (selectedProfileId) {
         const updated = await api.updateProfile(selectedProfileId, profileForm);
         setIsCreatingProfile(false);
+        setIsProfileEditorOpen(false);
         setSelectedProfileId(updated.id);
         setStatusLine(`Updated profile ${updated.name}`);
       } else {
         const created = await api.createProfile(profileForm);
         setIsCreatingProfile(false);
+        setIsProfileEditorOpen(false);
         setSelectedProfileId(created.id);
         setStatusLine(`Created profile ${created.name}`);
       }
@@ -267,6 +291,7 @@ export default function App() {
         setActiveRunId("");
         setTelemetry(null);
         setIsCreatingProfile(false);
+        setIsProfileEditorOpen(false);
       }
       closeMenu();
       setStatusLine("Deleted profile");
@@ -291,19 +316,21 @@ export default function App() {
     return profileId;
   };
 
-  const ensureProfileAndThread = async (): Promise<{ profileId: string; threadId: string }> => {
+  const ensureProfileAndThread = async (): Promise<{ profileId: string; threadId: string; threadTitle: string }> => {
     const profileId = await ensureProfile();
     let threadId = selectedThreadId;
+    let threadTitle = selectedThread?.title ?? `Thread ${new Date().toLocaleTimeString()}`;
     if (!threadId) {
       const thread = await api.createThread({
         agent_profile_id: profileId,
         title: `Thread ${new Date().toLocaleTimeString()}`,
       });
       threadId = thread.id;
+      threadTitle = thread.title;
       setSelectedThreadId(threadId);
     }
 
-    return { profileId, threadId };
+    return { profileId, threadId, threadTitle };
   };
 
   const onCreateThread = async () => {
@@ -383,11 +410,12 @@ export default function App() {
     return `${label} passed (${cacheState}${expiresIn}).`;
   };
 
-  const onSelectServer = async (server: MCPServer) => {
+  const onSelectServer = async (server: MCPServer, openEditor = false) => {
     setErrorMessage("");
     try {
       const detail = await api.getServer(server.id);
       setIsCreatingServer(false);
+      setIsServerEditorOpen(openEditor);
       setSelectedServerId(server.id);
       setMcpForm({
         ...serverToForm(server),
@@ -404,6 +432,7 @@ export default function App() {
 
   const onResetServerForm = () => {
     setIsCreatingServer(true);
+    setIsServerEditorOpen(true);
     setSelectedServerId("");
     setMcpForm(defaultMcpForm);
     setServerTestState({ status: "idle", message: "", tools: [] });
@@ -429,6 +458,7 @@ export default function App() {
           })
         : await api.createServer(payload);
       setIsCreatingServer(false);
+      setIsServerEditorOpen(false);
       setSelectedServerId(saved.id);
       const detail = await api.getServer(saved.id);
       setMcpForm({
@@ -452,6 +482,7 @@ export default function App() {
       if (selectedServerId === serverId) {
         setSelectedServerId("");
         setIsCreatingServer(false);
+        setIsServerEditorOpen(false);
         setMcpForm(defaultMcpForm);
         setServerTestState({ status: "idle", message: "", tools: [] });
       }
@@ -496,10 +527,11 @@ export default function App() {
     }
     setErrorMessage("");
     try {
-      const { threadId } = await ensureProfileAndThread();
+      const { profileId, threadId, threadTitle } = await ensureProfileAndThread();
       const content = chatInput;
       setChatInput("");
       setSelectedThreadId(threadId);
+      ensureThreadInState(threadId, profileId, threadTitle);
       appendMessageToThread(threadId, {
         id: `pending-user-${Date.now()}`,
         thread_id: threadId,
@@ -508,8 +540,8 @@ export default function App() {
         metadata_json: {},
         created_at: new Date().toISOString(),
       });
+      setWaitingThreadId(threadId);
       setStatusLine("Running agent");
-      await refreshAll();
       await api.streamMessage(threadId, content, (eventName, payload) => {
         const runId = String(payload.run_id ?? "");
         if (runId) setActiveRunId(runId);
@@ -533,6 +565,7 @@ export default function App() {
           });
         }
         if (eventName === "run.completed") {
+          setWaitingThreadId("");
           setStatusLine("Run completed");
           const assistantMessage = payload.assistant_message as ThreadMessage | undefined;
           if (assistantMessage) appendMessageToThread(threadId, assistantMessage);
@@ -540,6 +573,7 @@ export default function App() {
           if (runId) void refreshTelemetry(runId);
         }
         if (eventName === "run.failed") {
+          setWaitingThreadId("");
           setStatusLine(String(payload.error ?? "Run failed"));
           setErrorMessage(String(payload.error ?? "Run failed"));
           const assistantMessage = payload.assistant_message as ThreadMessage | undefined;
@@ -552,6 +586,7 @@ export default function App() {
       upsertThread(updatedThread);
       await refreshAll();
     } catch (error) {
+      setWaitingThreadId("");
       handleError(error, "Unable to send the message");
     }
   };
@@ -609,7 +644,12 @@ export default function App() {
                   </button>
                   {openMenu?.section === "profiles" && openMenu.id === profile.id && (
                     <div className="menu-popover">
-                      <button className="menu-item" onClick={() => onSelectProfile(profile)}>Edit</button>
+                      <button
+                        className="menu-item"
+                        onClick={() => onSelectProfile(profile, true)}
+                      >
+                        Edit
+                      </button>
                       <button className="menu-item danger" onClick={() => void onDeleteProfile(profile.id)}>Delete</button>
                     </div>
                   )}
@@ -617,7 +657,9 @@ export default function App() {
               </div>
             ))}
           </div>
-          <h3>{selectedProfileId ? "Edit Profile" : "New Profile"}</h3>
+          {isProfileEditorOpen && <h3>{selectedProfileId ? "Edit Profile" : "New Profile"}</h3>}
+          {isProfileEditorOpen && (
+            <>
           <label>Name</label>
           <input value={profileForm.name} onChange={(e) => onProfileField("name", e.target.value)} />
           <label>Role</label>
@@ -651,8 +693,12 @@ export default function App() {
             onChange={(e) => onProfileField("max_iterations", Number(e.target.value))}
           />
           <div className="row-actions">
-            <button onClick={onCreateProfile}>{selectedProfileId ? "Save Changes" : "Save Profile"}</button>
+            <div className="action-row">
+              <button onClick={onCreateProfile}>{selectedProfileId ? "Save Changes" : "Save Profile"}</button>
+            </div>
           </div>
+            </>
+          )}
         </section>
 
         <section className="panel">
@@ -664,7 +710,7 @@ export default function App() {
             <div className="mcp-server-list">
               {servers.map((server) => (
                 <div key={server.id} className={server.id === selectedServerId ? "entity-row selected" : "entity-row"}>
-                  <button className="entity-main" onClick={() => void onSelectServer(server)}>
+                    <button className="entity-main" onClick={() => void onSelectServer(server)}>
                     <strong>{server.label}</strong>
                     <span>{server.enabled ? "Enabled" : "Disabled"} · {server.approval_mode}</span>
                   </button>
@@ -681,7 +727,12 @@ export default function App() {
                     </button>
                     {openMenu?.section === "servers" && openMenu.id === server.id && (
                       <div className="menu-popover">
-                        <button className="menu-item" onClick={() => void onSelectServer(server)}>Edit</button>
+                        <button
+                          className="menu-item"
+                          onClick={() => void onSelectServer(server, true)}
+                        >
+                          Edit
+                        </button>
                         <button className="menu-item danger" onClick={() => void onDeleteServer(server.id)}>Delete</button>
                       </div>
                     )}
@@ -691,7 +742,9 @@ export default function App() {
             </div>
 
             <div className="mcp-editor">
-              <h3>{selectedServer ? selectedServer.label : "New MCP Server"}</h3>
+              {isServerEditorOpen && <h3>{selectedServer ? selectedServer.label : "New MCP Server"}</h3>}
+              {isServerEditorOpen && (
+                <>
               <p className="helper-text">
                 {selectedServer
                   ? "Update the selected server and test it from this editor."
@@ -725,7 +778,7 @@ export default function App() {
                 <option value="prompt">prompt</option>
                 <option value="auto">auto</option>
               </select>
-              <div className="row-actions">
+              <div className="action-row">
                 <button className="secondary-button" onClick={() => void onTestDraftServer()}>Test</button>
                 <button onClick={onCreateServer}>{selectedServerId ? "Save Changes" : "Save Server"}</button>
               </div>
@@ -745,6 +798,8 @@ export default function App() {
                   )}
                 </div>
               )}
+                </>
+              )}
           </div>
           </div>
         </section>
@@ -763,8 +818,8 @@ export default function App() {
             Thread: <strong>{selectedThread?.title ?? "No thread selected"}</strong>
           </p>
           <div className="entity-list thread-list">
-            {threads.map((thread) => (
-              <div key={thread.id} className={thread.id === selectedThreadId ? "entity-row selected" : "entity-row"}>
+              {threads.map((thread) => (
+                <div key={thread.id} className={thread.id === selectedThreadId ? "entity-row selected" : "entity-row"}>
                 <button
                   className="entity-main"
                   onClick={() => {
@@ -814,6 +869,12 @@ export default function App() {
                 <pre>{message.content}</pre>
               </article>
             ))}
+            {waitingThreadId === selectedThreadId && (
+              <article className="message assistant waiting">
+                <header>assistant</header>
+                <pre>Thinking...</pre>
+              </article>
+            )}
           </div>
 
           {pendingApprovals.length > 0 && (
