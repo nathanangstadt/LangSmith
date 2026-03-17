@@ -51,6 +51,10 @@ button.secondary-button {
   color: #2a4258;
 }
 
+input[type="checkbox"] {
+  width: auto;
+}
+
 input,
 select,
 textarea {
@@ -170,6 +174,81 @@ button.list-item {
 .list-card {
   display: grid;
   gap: 0.45rem;
+}
+
+.mcp-manager {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.mcp-server-list {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.mcp-server-item {
+  display: grid;
+  gap: 0.2rem;
+  width: 100%;
+  border-radius: 14px;
+  padding: 0.65rem 0.75rem;
+  background: rgba(243, 247, 251, 0.95);
+  color: #243646;
+  text-align: left;
+  border: 1px solid rgba(25, 33, 38, 0.1);
+}
+
+.mcp-server-item.selected {
+  background: #1d3d5b;
+  color: white;
+  outline: none;
+  border-color: #1d3d5b;
+}
+
+.mcp-server-item-title {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mcp-server-item-meta {
+  font-size: 0.8rem;
+  color: #52606d;
+}
+
+.mcp-server-item.selected .mcp-server-item-meta {
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.mcp-add-button {
+  width: 100%;
+  padding: 0.7rem 0.75rem;
+  background: rgba(255, 255, 255, 0.2);
+  color: #243646;
+  text-align: left;
+  border: 1px dashed rgba(25, 33, 38, 0.18);
+}
+
+.mcp-editor {
+  display: grid;
+  gap: 0.1rem;
+  padding-top: 0.15rem;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0.35rem;
+  padding: 0.55rem 0.7rem;
+  border-radius: 14px;
+  border: 1px solid rgba(25, 33, 38, 0.1);
+  background: rgba(243, 247, 251, 0.95);
+}
+
+.toggle-row label {
+  margin: 0;
 }
 
 .selected {

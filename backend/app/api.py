@@ -32,6 +32,7 @@ from app.schemas import (
     LLMConnectionCreate,
     MCPServerCreate,
     MCPServerOut,
+    MCPServerTestRequest,
     MCPServerUpdate,
     MessageCreate,
     MessageOut,
@@ -236,7 +237,22 @@ async def test_mcp_server(server_id: str, db: Session = Depends(get_db)) -> dict
 
 
 @router.post("/mcp-servers/test")
-async def test_mcp_server_draft(payload: MCPServerCreate) -> dict[str, Any]:
+async def test_mcp_server_draft(payload: MCPServerTestRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    existing_server: MCPServer | None = None
+    if payload.server_id:
+        existing_server = db.query(MCPServer).filter(MCPServer.id == payload.server_id).one_or_none()
+        if not existing_server:
+            raise HTTPException(status_code=404, detail="Saved MCP server not found")
+
+    client_id = payload.client_id or (
+        secret_box.decrypt(existing_server.client_id_encrypted) if existing_server else ""
+    )
+    client_secret = payload.client_secret or (
+        secret_box.decrypt(existing_server.client_secret_encrypted) if existing_server else ""
+    )
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=400, detail="Client ID and client secret are required to test this server")
+
     server = MCPServer(
         id="draft",
         name=payload.name,
@@ -244,8 +260,8 @@ async def test_mcp_server_draft(payload: MCPServerCreate) -> dict[str, Any]:
         server_url=payload.server_url,
         token_url=payload.token_url,
         grant_type=payload.grant_type,
-        client_id_encrypted=secret_box.encrypt(payload.client_id),
-        client_secret_encrypted=secret_box.encrypt(payload.client_secret),
+        client_id_encrypted=secret_box.encrypt(client_id),
+        client_secret_encrypted=secret_box.encrypt(client_secret),
         scope=payload.scope,
         allowed_tools=payload.allowed_tools,
         approval_mode=payload.approval_mode,

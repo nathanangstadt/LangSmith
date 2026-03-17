@@ -65,6 +65,23 @@ class MCPServerCreate(BaseModel):
     enabled: bool = True
 
 
+class MCPServerTestRequest(BaseModel):
+    server_id: str | None = None
+    name: str
+    label: str
+    server_url: str
+    token_url: str
+    grant_type: str = "client_credentials"
+    client_id: str = ""
+    client_secret: str = ""
+    scope: str = ""
+    allowed_tools: list[str] = Field(default_factory=list)
+    approval_mode: Literal["prompt", "auto"] = "prompt"
+    headers: dict[str, str] = Field(default_factory=dict)
+    timeout_ms: int = 20000
+    enabled: bool = True
+
+
 class MCPServerUpdate(BaseModel):
     label: str | None = None
     server_url: str | None = None
