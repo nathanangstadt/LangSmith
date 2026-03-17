@@ -394,18 +394,6 @@ export default function App() {
       setServerTestState({ status: "error", message });
       setErrorMessage(message);
       setStatusLine("MCP test failed");
-    } catch (error) {
-      const rawMessage = error instanceof Error ? error.message : "Unable to test the MCP server";
-      let message = rawMessage;
-      try {
-        const parsed = JSON.parse(rawMessage);
-        message = typeof parsed?.detail === "string" ? parsed.detail : rawMessage;
-      } catch {
-        message = rawMessage;
-      }
-      setServerTestState({ status: "error", message });
-      setErrorMessage(message);
-      setStatusLine("MCP test failed");
     }
   };
 
