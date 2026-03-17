@@ -59,7 +59,7 @@ pre {
 
 .shell {
   display: grid;
-  grid-template-columns: 370px 1fr;
+  grid-template-columns: minmax(320px, 360px) minmax(0, 1fr);
   min-height: 100vh;
   gap: 1rem;
   padding: 1rem;
@@ -71,8 +71,16 @@ pre {
   gap: 1rem;
 }
 
+.sidebar {
+  align-content: start;
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
 .workspace {
-  grid-template-columns: minmax(420px, 1.2fr) minmax(360px, 0.8fr);
+  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.85fr);
+  min-width: 0;
 }
 
 .panel {
@@ -89,6 +97,7 @@ pre {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 0.75rem;
 }
 
@@ -138,6 +147,7 @@ pre {
 .chat-pane,
 .telemetry-pane {
   min-height: calc(100vh - 2rem);
+  min-width: 0;
 }
 
 .messages {
@@ -173,6 +183,28 @@ pre {
   font-size: 0.85rem;
 }
 
+.helper-text {
+  margin: 0.5rem 0 0;
+  color: #52606d;
+}
+
+.error-banner,
+.result-banner {
+  margin: 0.75rem 0 0;
+  border-radius: 16px;
+  padding: 0.75rem 0.9rem;
+}
+
+.error-banner {
+  background: #fde9e7;
+  color: #8b2f2a;
+}
+
+.result-banner {
+  background: #edf3d8;
+  color: #355126;
+}
+
 .telemetry-summary {
   display: grid;
   gap: 0.4rem;
@@ -194,6 +226,12 @@ label {
   .shell,
   .workspace {
     grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    max-height: none;
+    overflow: visible;
+    padding-right: 0;
   }
 
   .chat-pane,

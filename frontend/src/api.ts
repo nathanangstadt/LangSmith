@@ -21,6 +21,8 @@ export const api = {
   listProfiles: () => request<AgentProfile[]>("/agent-profiles"),
   createProfile: (body: Record<string, unknown>) =>
     request<AgentProfile>("/agent-profiles", { method: "POST", body: JSON.stringify(body) }),
+  updateProfile: (profileId: string, body: Record<string, unknown>) =>
+    request<AgentProfile>(`/agent-profiles/${profileId}`, { method: "PATCH", body: JSON.stringify(body) }),
   importAgentMd: (content: string) =>
     request<{ profile: AgentProfile; frontmatter: Record<string, unknown> }>("/agent-profiles/import-agent-md", {
       method: "POST",
@@ -78,4 +80,3 @@ export const api = {
     }
   },
 };
-

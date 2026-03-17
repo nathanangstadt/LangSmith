@@ -2,6 +2,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.agent_md import export_agent_md, parse_agent_md
@@ -23,6 +24,7 @@ from app.schemas import (
     AgentMdImportRequest,
     AgentProfileCreate,
     AgentProfileOut,
+    AgentProfileUpdate,
     AgentRunOut,
     ApprovalResolve,
     LLMConnectionCreate,
@@ -59,7 +61,11 @@ def create_llm_connection(payload: LLMConnectionCreate, db: Session = Depends(ge
 def create_agent_profile(payload: AgentProfileCreate, db: Session = Depends(get_db)) -> AgentProfile:
     profile = AgentProfile(**payload.model_dump())
     db.add(profile)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"Agent profile '{payload.name}' already exists")
     db.refresh(profile)
     return profile
 
@@ -75,6 +81,26 @@ def get_agent_profile(profile_id: str, db: Session = Depends(get_db)) -> AgentPr
     profile = db.query(AgentProfile).filter(AgentProfile.id == profile_id).one_or_none()
     if not profile:
         raise HTTPException(status_code=404, detail="Agent profile not found")
+    return profile
+
+
+@router.patch("/agent-profiles/{profile_id}", response_model=AgentProfileOut)
+def update_agent_profile(
+    profile_id: str,
+    payload: AgentProfileUpdate,
+    db: Session = Depends(get_db),
+) -> AgentProfile:
+    profile = db.query(AgentProfile).filter(AgentProfile.id == profile_id).one_or_none()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Agent profile not found")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(profile, key, value)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Agent profile update conflicts with an existing name")
+    db.refresh(profile)
     return profile
 
 
@@ -152,7 +178,11 @@ def create_mcp_server(payload: MCPServerCreate, db: Session = Depends(get_db)) -
         enabled=payload.enabled,
     )
     db.add(server)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=f"MCP server '{payload.name}' already exists")
     db.refresh(server)
     return server
 

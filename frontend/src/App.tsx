@@ -1,4 +1,4 @@
-import { ChangeEvent, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { api } from "./api";
 import type { AgentProfile, MCPServer, PendingApproval, RunTelemetry, Thread } from "./types";
@@ -51,9 +51,11 @@ export default function App() {
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
   const [agentMd, setAgentMd] = useState("");
   const [statusLine, setStatusLine] = useState("Idle");
+  const [errorMessage, setErrorMessage] = useState("");
+  const [serverTestResult, setServerTestResult] = useState<string>("");
 
   useEffect(() => {
-    void refreshAll();
+    void initializeWorkspace();
   }, []);
 
   const refreshAll = async () => {
@@ -67,6 +69,37 @@ export default function App() {
     setServers(serverData);
     if (!selectedProfileId && profileData[0]) setSelectedProfileId(profileData[0].id);
     if (!selectedThreadId && threadData[0]) setSelectedThreadId(threadData[0].id);
+    return { profileData, threadData, serverData };
+  };
+
+  const initializeWorkspace = async () => {
+    try {
+      const { profileData, threadData } = await refreshAll();
+      if (profileData.length === 0) {
+        const profile = await api.createProfile(defaultProfileForm);
+        setSelectedProfileId(profile.id);
+        const thread = await api.createThread({
+          agent_profile_id: profile.id,
+          title: "Starter Thread",
+        });
+        setSelectedThreadId(thread.id);
+        setStatusLine("Created a starter profile and thread");
+        await refreshAll();
+        return;
+      }
+      if (threadData.length === 0) {
+        const profileId = profileData[0].id;
+        const thread = await api.createThread({
+          agent_profile_id: profileId,
+          title: "Starter Thread",
+        });
+        setSelectedThreadId(thread.id);
+        setStatusLine("Created a starter thread");
+        await refreshAll();
+      }
+    } catch (error) {
+      handleError(error, "Unable to initialize the workspace");
+    }
   };
 
   const refreshTelemetry = async (runId: string) => {
@@ -75,26 +108,103 @@ export default function App() {
   };
 
   const selectedThread = threads.find((thread) => thread.id === selectedThreadId);
+  const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId);
+
+  useEffect(() => {
+    if (!selectedProfile) return;
+    setProfileForm({
+      name: selectedProfile.name,
+      role: selectedProfile.role,
+      guidelines: selectedProfile.guidelines,
+      output_style: selectedProfile.output_style,
+      model_name: selectedProfile.model_name,
+      temperature: selectedProfile.temperature,
+      max_iterations: selectedProfile.max_iterations,
+      telemetry_json: {
+        metadata: {
+          ...((selectedProfile.telemetry_json.metadata as Record<string, unknown> | undefined) ?? {}),
+          environment: String(
+            ((selectedProfile.telemetry_json.metadata as Record<string, unknown> | undefined)?.environment ?? "local"),
+          ),
+        },
+        langsmith_project: selectedProfile.telemetry_json.langsmith_project ?? "agent-playground",
+        tags: selectedProfile.telemetry_json.tags ?? ["playground", "mcp"],
+        otel_enabled: selectedProfile.telemetry_json.otel_enabled ?? true,
+        otel_service_name: selectedProfile.telemetry_json.otel_service_name ?? "agent-playground",
+      },
+      ui_json: selectedProfile.ui_json ?? {},
+    });
+  }, [selectedProfileId, selectedProfile]);
+
+  const handleError = (error: unknown, fallback: string) => {
+    const message = error instanceof Error ? error.message : fallback;
+    setErrorMessage(message || fallback);
+    setStatusLine("Action failed");
+  };
 
   const onProfileField = (key: string, value: string | number) => {
     setProfileForm((current) => ({ ...current, [key]: value }));
   };
 
   const onCreateProfile = async () => {
-    const created = await api.createProfile(profileForm);
-    setSelectedProfileId(created.id);
-    setProfileForm(defaultProfileForm);
-    await refreshAll();
+    setErrorMessage("");
+    try {
+      if (selectedProfileId) {
+        const updated = await api.updateProfile(selectedProfileId, profileForm);
+        setSelectedProfileId(updated.id);
+        setStatusLine(`Updated profile ${updated.name}`);
+      } else {
+        const created = await api.createProfile(profileForm);
+        setSelectedProfileId(created.id);
+        setStatusLine(`Created profile ${created.name}`);
+      }
+      await refreshAll();
+    } catch (error) {
+      handleError(error, "Unable to save the profile");
+    }
+  };
+
+  const ensureProfile = async (): Promise<string> => {
+    let profileId = selectedProfileId || profiles[0]?.id || "";
+    if (!profileId) {
+      const profile = await api.createProfile(profileForm);
+      profileId = profile.id;
+      setSelectedProfileId(profileId);
+    } else {
+      await api.updateProfile(profileId, profileForm);
+    }
+    return profileId;
+  };
+
+  const ensureProfileAndThread = async (): Promise<{ profileId: string; threadId: string }> => {
+    const profileId = await ensureProfile();
+    let threadId = selectedThreadId;
+    if (!threadId) {
+      const thread = await api.createThread({
+        agent_profile_id: profileId,
+        title: `Thread ${new Date().toLocaleTimeString()}`,
+      });
+      threadId = thread.id;
+      setSelectedThreadId(threadId);
+    }
+
+    return { profileId, threadId };
   };
 
   const onCreateThread = async () => {
-    if (!selectedProfileId) return;
-    const thread = await api.createThread({
-      agent_profile_id: selectedProfileId,
-      title: `Thread ${new Date().toLocaleTimeString()}`,
-    });
-    setSelectedThreadId(thread.id);
-    await refreshAll();
+    setErrorMessage("");
+    try {
+      const profileId = await ensureProfile();
+      const thread = await api.createThread({
+        agent_profile_id: profileId,
+        title: `Thread ${new Date().toLocaleTimeString()}`,
+      });
+      setSelectedThreadId(thread.id);
+      setStatusLine(`Created ${thread.title}`);
+      await refreshAll();
+    } catch (error) {
+      handleError(error, "Unable to create a thread");
+    }
   };
 
   const onMcpField = (key: string, value: string | number | boolean) => {
@@ -102,73 +212,108 @@ export default function App() {
   };
 
   const onCreateServer = async () => {
-    await api.createServer({
-      ...mcpForm,
-      allowed_tools: mcpForm.allowed_tools
-        .split(",")
-        .map((tool) => tool.trim())
-        .filter(Boolean),
-      headers: JSON.parse(mcpForm.headers),
-    });
-    setMcpForm(defaultMcpForm);
-    await refreshAll();
+    setErrorMessage("");
+    try {
+      const created = await api.createServer({
+        ...mcpForm,
+        allowed_tools: mcpForm.allowed_tools
+          .split(",")
+          .map((tool) => tool.trim())
+          .filter(Boolean),
+        headers: JSON.parse(mcpForm.headers),
+      });
+      setMcpForm(defaultMcpForm);
+      setStatusLine(`Saved MCP server ${created.label}`);
+      await refreshAll();
+    } catch (error) {
+      handleError(error, "Unable to save the MCP server");
+    }
   };
 
   const onImportAgentMd = async () => {
     if (!agentMd.trim()) return;
-    const result = await api.importAgentMd(agentMd);
-    setSelectedProfileId(result.profile.id);
-    setStatusLine(`Imported agent.md into profile ${result.profile.name}`);
-    await refreshAll();
+    setErrorMessage("");
+    try {
+      const result = await api.importAgentMd(agentMd);
+      setSelectedProfileId(result.profile.id);
+      setStatusLine(`Imported agent.md into profile ${result.profile.name}`);
+      await refreshAll();
+    } catch (error) {
+      handleError(error, "Unable to import agent.md");
+    }
   };
 
   const onExportAgentMd = async () => {
     if (!selectedProfileId) return;
-    const content = await api.exportAgentMd(selectedProfileId);
-    setAgentMd(content);
-    setStatusLine("Exported agent.md for the selected profile");
+    setErrorMessage("");
+    try {
+      const content = await api.exportAgentMd(selectedProfileId);
+      setAgentMd(content);
+      setStatusLine("Exported agent.md for the selected profile");
+    } catch (error) {
+      handleError(error, "Unable to export agent.md");
+    }
   };
 
   const onSendMessage = async () => {
-    if (!selectedThreadId || !chatInput.trim()) return;
-    const content = chatInput;
-    setChatInput("");
-    setStatusLine("Running agent");
-    await api.streamMessage(selectedThreadId, content, (eventName, payload) => {
-      if (eventName === "run.approval.requested") {
-        setPendingApprovals((current) => [...current, payload as unknown as PendingApproval]);
-        setActiveRunId(String(payload.run_id));
-        setStatusLine("Waiting for MCP approval");
-      }
-      if (eventName === "message.delta") {
-        void api.getThread(selectedThreadId).then((thread) => {
-          setThreads((current) => current.map((item) => (item.id === thread.id ? thread : item)));
-        });
-      }
-      if (eventName === "run.completed") {
-        setActiveRunId(String(payload.run_id));
-        setStatusLine("Run completed");
-        void refreshAll();
-        void refreshTelemetry(String(payload.run_id));
-      }
-      if (eventName === "run.failed") {
-        setStatusLine(String(payload.error ?? "Run failed"));
-      }
-    });
-    await refreshAll();
+    if (!chatInput.trim()) {
+      setStatusLine("Enter a message first");
+      return;
+    }
+    setErrorMessage("");
+    try {
+      const { threadId } = await ensureProfileAndThread();
+      const content = chatInput;
+      setChatInput("");
+      setStatusLine("Running agent");
+      await refreshAll();
+      await api.streamMessage(threadId, content, (eventName, payload) => {
+        if (eventName === "run.approval.requested") {
+          setPendingApprovals((current) => [...current, payload as unknown as PendingApproval]);
+          setActiveRunId(String(payload.run_id));
+          setStatusLine("Waiting for MCP approval");
+        }
+        if (eventName === "message.delta") {
+          void api.getThread(threadId).then((thread) => {
+            setThreads((current) => {
+              const existing = current.some((item) => item.id === thread.id);
+              if (!existing) return [thread, ...current];
+              return current.map((item) => (item.id === thread.id ? thread : item));
+            });
+          });
+        }
+        if (eventName === "run.completed") {
+          setActiveRunId(String(payload.run_id));
+          setStatusLine("Run completed");
+          void refreshAll();
+          void refreshTelemetry(String(payload.run_id));
+        }
+        if (eventName === "run.failed") {
+          setStatusLine(String(payload.error ?? "Run failed"));
+        }
+      });
+      await refreshAll();
+    } catch (error) {
+      handleError(error, "Unable to send the message");
+    }
   };
 
   const onResolveApproval = async (approval: PendingApproval, status: "approved" | "denied") => {
-    const result = await api.resolveApproval(approval.run_id, approval.approval_id, {
-      status,
-      rationale: status === "approved" ? "Approved in playground UI" : "Denied in playground UI",
-    });
-    setPendingApprovals((current) => current.filter((item) => item.approval_id !== approval.approval_id));
-    setActiveRunId(result.run.id);
-    setStatusLine(`Approval ${status}`);
-    if (result.assistant_message) {
-      await refreshAll();
-      await refreshTelemetry(result.run.id);
+    setErrorMessage("");
+    try {
+      const result = await api.resolveApproval(approval.run_id, approval.approval_id, {
+        status,
+        rationale: status === "approved" ? "Approved in playground UI" : "Denied in playground UI",
+      });
+      setPendingApprovals((current) => current.filter((item) => item.approval_id !== approval.approval_id));
+      setActiveRunId(result.run.id);
+      setStatusLine(`Approval ${status}`);
+      if (result.assistant_message) {
+        await refreshAll();
+        await refreshTelemetry(result.run.id);
+      }
+    } catch (error) {
+      handleError(error, "Unable to resolve the approval");
     }
   };
 
@@ -178,6 +323,8 @@ export default function App() {
         <section className="panel">
           <h1>Agent Playground</h1>
           <p className="muted">{statusLine}</p>
+          {errorMessage && <p className="error-banner">{errorMessage}</p>}
+          {serverTestResult && <p className="result-banner">{serverTestResult}</p>}
         </section>
 
         <section className="panel">
@@ -220,7 +367,10 @@ export default function App() {
               <button
                 key={profile.id}
                 className={profile.id === selectedProfileId ? "list-item selected" : "list-item"}
-                onClick={() => setSelectedProfileId(profile.id)}
+                onClick={() => {
+                  setSelectedProfileId(profile.id);
+                  setStatusLine(`Selected profile ${profile.name}`);
+                }}
               >
                 <strong>{profile.name}</strong>
                 <span>{profile.model_name}</span>
@@ -261,7 +411,20 @@ export default function App() {
                 <strong>{server.label}</strong>
                 <span>{server.server_url}</span>
                 <span>{server.approval_mode} / {server.enabled ? "enabled" : "disabled"}</span>
-                <button onClick={() => void api.testServer(server.id).then(() => setStatusLine(`Tested ${server.name}`))}>
+                <button
+                  onClick={() =>
+                    void api
+                      .testServer(server.id)
+                      .then((result) => {
+                        setServerTestResult(
+                          `Tested ${server.name}: ${(result.token_meta as { cache?: string } | undefined)?.cache ?? "ok"}`,
+                        );
+                        setStatusLine(`Tested ${server.name}`);
+                        setErrorMessage("");
+                      })
+                      .catch((error) => handleError(error, `Unable to test ${server.name}`))
+                  }
+                >
                   Test
                 </button>
               </div>
@@ -285,16 +448,24 @@ export default function App() {
         <section className="chat-pane panel">
           <div className="panel-header">
             <h2>Threads</h2>
-            <button onClick={onCreateThread} disabled={!selectedProfileId}>
+            <button onClick={onCreateThread}>
               New Thread
             </button>
           </div>
+          <p className="helper-text">
+            Profile: <strong>{selectedProfile?.name ?? "Draft profile"}</strong>
+            {" · "}
+            Thread: <strong>{selectedThread?.title ?? "No thread selected"}</strong>
+          </p>
           <div className="thread-strip">
             {threads.map((thread) => (
               <button
                 key={thread.id}
                 className={thread.id === selectedThreadId ? "thread-chip selected" : "thread-chip"}
-                onClick={() => setSelectedThreadId(thread.id)}
+                onClick={() => {
+                  setSelectedThreadId(thread.id);
+                  setStatusLine(`Selected ${thread.title}`);
+                }}
               >
                 {thread.title}
               </button>
@@ -399,4 +570,3 @@ export default function App() {
     </div>
   );
 }
-

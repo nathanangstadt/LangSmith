@@ -36,6 +36,19 @@ class AgentProfileCreate(BaseModel):
     llm_connection_id: str | None = None
 
 
+class AgentProfileUpdate(BaseModel):
+    name: str | None = None
+    role: str | None = None
+    guidelines: str | None = None
+    output_style: str | None = None
+    model_name: str | None = None
+    temperature: float | None = None
+    max_iterations: int | None = None
+    telemetry_json: dict[str, Any] | None = None
+    ui_json: dict[str, Any] | None = None
+    llm_connection_id: str | None = None
+
+
 class MCPServerCreate(BaseModel):
     name: str
     label: str
@@ -210,4 +223,3 @@ class AgentRunOut(BaseModel):
 class RunResumeResponse(BaseModel):
     run: AgentRunOut
     assistant_message: MessageOut | None = None
-
