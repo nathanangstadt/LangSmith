@@ -244,6 +244,25 @@ export default function App() {
     }
   };
 
+  const onDeleteThread = async (threadId: string) => {
+    setErrorMessage("");
+    try {
+      await api.deleteThread(threadId);
+      const remainingThreads = threads.filter((thread) => thread.id !== threadId);
+      setThreads(remainingThreads);
+      if (selectedThreadId === threadId) {
+        setSelectedThreadId(remainingThreads[0]?.id ?? "");
+        setPendingApprovals([]);
+        setActiveRunId("");
+        setTelemetry(null);
+      }
+      setStatusLine("Deleted thread");
+      await refreshAll();
+    } catch (error) {
+      handleError(error, "Unable to delete the thread");
+    }
+  };
+
   const onMcpField = (key: string, value: string | number | boolean) => {
     setMcpForm((current) => ({ ...current, [key]: value }));
   };
@@ -487,16 +506,25 @@ export default function App() {
           </p>
           <div className="thread-strip">
             {threads.map((thread) => (
-              <button
-                key={thread.id}
-                className={thread.id === selectedThreadId ? "thread-chip selected" : "thread-chip"}
-                onClick={() => {
-                  setSelectedThreadId(thread.id);
-                  setStatusLine(`Selected ${thread.title}`);
-                }}
-              >
-                {thread.title}
-              </button>
+              <div key={thread.id} className={thread.id === selectedThreadId ? "thread-pill selected" : "thread-pill"}>
+                <button
+                  className="thread-chip"
+                  onClick={() => {
+                    setSelectedThreadId(thread.id);
+                    setStatusLine(`Selected ${thread.title}`);
+                  }}
+                >
+                  {thread.title}
+                </button>
+                <button
+                  className="thread-delete"
+                  onClick={() => void onDeleteThread(thread.id)}
+                  aria-label={`Delete ${thread.title}`}
+                  title={`Delete ${thread.title}`}
+                >
+                  Delete
+                </button>
+              </div>
             ))}
           </div>
 

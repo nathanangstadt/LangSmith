@@ -40,6 +40,7 @@ export const api = {
   getThread: (threadId: string) => request<Thread>(`/threads/${threadId}`),
   createThread: (body: Record<string, unknown>) =>
     request<Thread>("/threads", { method: "POST", body: JSON.stringify(body) }),
+  deleteThread: (threadId: string) => request<{ ok: boolean }>(`/threads/${threadId}`, { method: "DELETE" }),
   getTelemetry: (runId: string) => request<RunTelemetry>(`/runs/${runId}/telemetry`),
   resolveApproval: (runId: string, approvalId: string, body: Record<string, unknown>) =>
     request<{ run: { id: string; status: string }; assistant_message?: Thread["messages"][number] }>(

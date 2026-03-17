@@ -2,6 +2,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse
+from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -261,6 +262,24 @@ def get_thread(thread_id: str, db: Session = Depends(get_db)) -> ThreadOut:
         updated_at=thread.updated_at,
         messages=[MessageOut.model_validate(message) for message in messages],
     )
+
+
+@router.delete("/threads/{thread_id}")
+def delete_thread(thread_id: str, db: Session = Depends(get_db)) -> dict[str, bool]:
+    thread = db.query(Thread).filter(Thread.id == thread_id).one_or_none()
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    run_ids = [run_id for (run_id,) in db.query(AgentRun.id).filter(AgentRun.thread_id == thread_id).all()]
+    if run_ids:
+        db.execute(delete(TelemetryEvent).where(TelemetryEvent.run_id.in_(run_ids)))
+        db.execute(delete(RunStep).where(RunStep.run_id.in_(run_ids)))
+        db.execute(delete(ApprovalDecision).where(ApprovalDecision.run_id.in_(run_ids)))
+        db.execute(delete(AgentRun).where(AgentRun.id.in_(run_ids)))
+    db.execute(delete(Message).where(Message.thread_id == thread_id))
+    db.delete(thread)
+    db.commit()
+    return {"ok": True}
 
 
 @router.post("/threads/{thread_id}/messages")

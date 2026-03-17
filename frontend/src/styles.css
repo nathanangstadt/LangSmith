@@ -145,10 +145,10 @@ pre {
 
 .list-item,
 .list-card,
-.thread-chip,
 .timeline-card,
 .approval-card,
-.message {
+.message,
+.thread-pill {
   border-radius: 16px;
   padding: 0.7rem;
   background: rgba(243, 247, 251, 0.95);
@@ -158,7 +158,6 @@ pre {
 button.list-item,
 button.thread-chip {
   display: block;
-  width: 100%;
   text-align: left;
 }
 
@@ -180,26 +179,53 @@ button.list-item {
   overflow-x: auto;
 }
 
-.thread-chip {
+.thread-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
   min-width: 120px;
+  max-width: 100%;
+  background: #eef2f7;
+  border: 1px solid rgba(61, 80, 98, 0.18);
+  padding: 0.2rem;
+}
+
+.thread-pill.selected {
+  background: #1d3d5b;
+  border-color: #1d3d5b;
+  outline: none;
+}
+
+.thread-chip {
+  min-width: 0;
   width: auto;
   max-width: 100%;
-  text-align: left;
-  background: #eef2f7;
+  flex: 1 1 auto;
+  padding: 0.38rem 0.58rem;
+  background: transparent;
   color: #405163;
-  border: 1px solid rgba(61, 80, 98, 0.18);
-  padding: 0.5rem 0.8rem;
+  border: 0;
   font-size: 0.88rem;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.thread-chip.selected {
-  background: #1d3d5b;
+.thread-pill.selected .thread-chip {
   color: white;
-  border-color: #1d3d5b;
-  outline: none;
+}
+
+.thread-delete {
+  flex: 0 0 auto;
+  padding: 0.35rem 0.5rem;
+  background: rgba(180, 79, 79, 0.12);
+  color: #8b2f2a;
+  font-size: 0.78rem;
+}
+
+.thread-pill.selected .thread-delete {
+  background: rgba(255, 255, 255, 0.18);
+  color: white;
 }
 
 .chat-pane,
