@@ -35,6 +35,8 @@ export const api = {
     request<MCPServer>("/mcp-servers", { method: "POST", body: JSON.stringify(body) }),
   updateServer: (serverId: string, body: Record<string, unknown>) =>
     request<MCPServer>(`/mcp-servers/${serverId}`, { method: "PATCH", body: JSON.stringify(body) }),
+  testDraftServer: (body: Record<string, unknown>) =>
+    request<Record<string, unknown>>("/mcp-servers/test", { method: "POST", body: JSON.stringify(body) }),
   testServer: (serverId: string) => request<Record<string, unknown>>(`/mcp-servers/${serverId}/test`, { method: "POST" }),
   listThreads: () => request<Thread[]>("/threads"),
   getThread: (threadId: string) => request<Thread>(`/threads/${threadId}`),

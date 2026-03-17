@@ -1,5 +1,6 @@
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from sqlalchemy import delete
@@ -42,6 +43,21 @@ from app.security import secret_box
 
 
 router = APIRouter()
+
+
+async def _test_server_config(server: MCPServer) -> dict[str, Any]:
+    try:
+        tool, meta = await build_openai_mcp_tool(server)
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text.strip() or str(exc)
+        raise HTTPException(status_code=400, detail=f"MCP token request failed: {detail}")
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=400, detail=f"MCP connection failed: {exc}")
+    return {
+        "ok": True,
+        "tool": tool | {"authorization": "<redacted>"},
+        "token_meta": meta,
+    }
 
 
 @router.get("/health")
@@ -216,8 +232,28 @@ async def test_mcp_server(server_id: str, db: Session = Depends(get_db)) -> dict
     server = db.query(MCPServer).filter(MCPServer.id == server_id).one_or_none()
     if not server:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    tool, meta = await build_openai_mcp_tool(server)
-    return {"ok": True, "tool": tool | {"authorization": "<redacted>"}, "token_meta": meta}
+    return await _test_server_config(server)
+
+
+@router.post("/mcp-servers/test")
+async def test_mcp_server_draft(payload: MCPServerCreate) -> dict[str, Any]:
+    server = MCPServer(
+        id="draft",
+        name=payload.name,
+        label=payload.label,
+        server_url=payload.server_url,
+        token_url=payload.token_url,
+        grant_type=payload.grant_type,
+        client_id_encrypted=secret_box.encrypt(payload.client_id),
+        client_secret_encrypted=secret_box.encrypt(payload.client_secret),
+        scope=payload.scope,
+        allowed_tools=payload.allowed_tools,
+        approval_mode=payload.approval_mode,
+        headers=payload.headers,
+        timeout_ms=payload.timeout_ms,
+        enabled=payload.enabled,
+    )
+    return await _test_server_config(server)
 
 
 @router.post("/threads", response_model=ThreadOut)

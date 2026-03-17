@@ -167,6 +167,11 @@ button.list-item {
   color: #243646;
 }
 
+.list-card {
+  display: grid;
+  gap: 0.45rem;
+}
+
 .selected {
   outline: 2px solid #d56a4e;
 }
@@ -279,6 +284,11 @@ button.list-item {
   margin: 0.35rem 0 0;
   color: #52606d;
   font-size: 0.85rem;
+}
+
+.server-url {
+  display: block;
+  overflow-wrap: anywhere;
 }
 
 .error-banner,
