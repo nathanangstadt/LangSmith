@@ -39,6 +39,7 @@ const defaultMcpForm = {
 
 type ThreadMessage = Thread["messages"][number];
 type MpcFormState = typeof defaultMcpForm;
+type MenuState = { section: "profiles" | "threads" | "servers"; id: string } | null;
 type ServerTestState = {
   status: "idle" | "success" | "error";
   message: string;
@@ -53,6 +54,8 @@ export default function App() {
   const [selectedThreadId, setSelectedThreadId] = useState<string>("");
   const [selectedServerId, setSelectedServerId] = useState<string>("");
   const [isCreatingServer, setIsCreatingServer] = useState(false);
+  const [isCreatingProfile, setIsCreatingProfile] = useState(false);
+  const [openMenu, setOpenMenu] = useState<MenuState>(null);
   const [profileForm, setProfileForm] = useState(defaultProfileForm);
   const [mcpForm, setMcpForm] = useState(defaultMcpForm);
   const [chatInput, setChatInput] = useState("");
@@ -206,21 +209,73 @@ export default function App() {
     setProfileForm((current) => ({ ...current, [key]: value }));
   };
 
+  const toggleMenu = (section: MenuState["section"], id: string) => {
+    setOpenMenu((current) => {
+      if (current?.section === section && current.id === id) return null;
+      return { section, id };
+    });
+  };
+
+  const closeMenu = () => {
+    setOpenMenu(null);
+  };
+
+  const onResetProfileForm = () => {
+    setIsCreatingProfile(true);
+    setSelectedProfileId("");
+    setProfileForm(defaultProfileForm);
+    closeMenu();
+    setStatusLine("Ready to add a profile");
+  };
+
+  const onSelectProfile = (profile: AgentProfile) => {
+    setIsCreatingProfile(false);
+    setSelectedProfileId(profile.id);
+    closeMenu();
+    setStatusLine(`Selected profile ${profile.name}`);
+  };
+
   const onCreateProfile = async () => {
     setErrorMessage("");
     try {
       if (selectedProfileId) {
         const updated = await api.updateProfile(selectedProfileId, profileForm);
+        setIsCreatingProfile(false);
         setSelectedProfileId(updated.id);
         setStatusLine(`Updated profile ${updated.name}`);
       } else {
         const created = await api.createProfile(profileForm);
+        setIsCreatingProfile(false);
         setSelectedProfileId(created.id);
         setStatusLine(`Created profile ${created.name}`);
       }
+      closeMenu();
       await refreshAll();
     } catch (error) {
       handleError(error, "Unable to save the profile");
+    }
+  };
+
+  const onDeleteProfile = async (profileId: string) => {
+    setErrorMessage("");
+    try {
+      await api.deleteProfile(profileId);
+      if (selectedProfileId === profileId) {
+        setSelectedProfileId("");
+        setSelectedThreadId("");
+        setPendingApprovals([]);
+        setActiveRunId("");
+        setTelemetry(null);
+        setIsCreatingProfile(false);
+      }
+      closeMenu();
+      setStatusLine("Deleted profile");
+      const { profileData } = await refreshAll();
+      if (profileData.length === 0) {
+        await initializeWorkspace();
+      }
+    } catch (error) {
+      handleError(error, "Unable to delete the profile");
     }
   };
 
@@ -260,6 +315,7 @@ export default function App() {
         title: `Thread ${new Date().toLocaleTimeString()}`,
       });
       setSelectedThreadId(thread.id);
+      closeMenu();
       setStatusLine(`Created ${thread.title}`);
       await refreshAll();
     } catch (error) {
@@ -279,6 +335,7 @@ export default function App() {
         setActiveRunId("");
         setTelemetry(null);
       }
+      closeMenu();
       setStatusLine("Deleted thread");
       await refreshAll();
     } catch (error) {
@@ -337,6 +394,7 @@ export default function App() {
         client_id: detail.client_id,
         client_secret: detail.client_secret,
       });
+      closeMenu();
       setServerTestState({ status: "idle", message: "", tools: [] });
       setStatusLine(`Selected ${server.label}`);
     } catch (error) {
@@ -349,6 +407,7 @@ export default function App() {
     setSelectedServerId("");
     setMcpForm(defaultMcpForm);
     setServerTestState({ status: "idle", message: "", tools: [] });
+    closeMenu();
     setStatusLine("Ready to add an MCP server");
   };
 
@@ -379,9 +438,28 @@ export default function App() {
       });
       setStatusLine(`${selectedServerId ? "Updated" : "Saved"} MCP server ${saved.label}`);
       setServerTestState({ status: "idle", message: "", tools: [] });
+      closeMenu();
       await refreshAll();
     } catch (error) {
       handleError(error, "Unable to save the MCP server");
+    }
+  };
+
+  const onDeleteServer = async (serverId: string) => {
+    setErrorMessage("");
+    try {
+      await api.deleteServer(serverId);
+      if (selectedServerId === serverId) {
+        setSelectedServerId("");
+        setIsCreatingServer(false);
+        setMcpForm(defaultMcpForm);
+        setServerTestState({ status: "idle", message: "", tools: [] });
+      }
+      closeMenu();
+      setStatusLine("Deleted MCP server");
+      await refreshAll();
+    } catch (error) {
+      handleError(error, "Unable to delete the MCP server");
     }
   };
 
@@ -509,8 +587,37 @@ export default function App() {
         <section className="panel">
           <div className="panel-header">
             <h2>Profiles</h2>
-            <button onClick={onCreateProfile}>Save</button>
+            <button className="icon-button" onClick={onResetProfileForm} aria-label="Add profile">+</button>
           </div>
+          <div className="entity-list">
+            {profiles.map((profile) => (
+              <div key={profile.id} className={profile.id === selectedProfileId ? "entity-row selected" : "entity-row"}>
+                <button className="entity-main" onClick={() => onSelectProfile(profile)}>
+                  <strong>{profile.name}</strong>
+                  <span>{profile.model_name}</span>
+                </button>
+                <div className="entity-actions">
+                  <button
+                    className="kebab-button secondary-button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      toggleMenu("profiles", profile.id);
+                    }}
+                    aria-label={`Profile options for ${profile.name}`}
+                  >
+                    ⋮
+                  </button>
+                  {openMenu?.section === "profiles" && openMenu.id === profile.id && (
+                    <div className="menu-popover">
+                      <button className="menu-item" onClick={() => onSelectProfile(profile)}>Edit</button>
+                      <button className="menu-item danger" onClick={() => void onDeleteProfile(profile.id)}>Delete</button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+          <h3>{selectedProfileId ? "Edit Profile" : "New Profile"}</h3>
           <label>Name</label>
           <input value={profileForm.name} onChange={(e) => onProfileField("name", e.target.value)} />
           <label>Role</label>
@@ -543,42 +650,44 @@ export default function App() {
             value={profileForm.max_iterations}
             onChange={(e) => onProfileField("max_iterations", Number(e.target.value))}
           />
-          <div className="list">
-            {profiles.map((profile) => (
-              <button
-                key={profile.id}
-                className={profile.id === selectedProfileId ? "list-item selected" : "list-item"}
-                onClick={() => {
-                  setSelectedProfileId(profile.id);
-                  setStatusLine(`Selected profile ${profile.name}`);
-                }}
-              >
-                <strong>{profile.name}</strong>
-                <span>{profile.model_name}</span>
-              </button>
-            ))}
+          <div className="row-actions">
+            <button onClick={onCreateProfile}>{selectedProfileId ? "Save Changes" : "Save Profile"}</button>
           </div>
         </section>
 
         <section className="panel">
           <div className="panel-header">
             <h2>MCP Servers</h2>
+            <button className="icon-button" onClick={onResetServerForm} aria-label="Add MCP server">+</button>
           </div>
           <div className="mcp-manager">
             <div className="mcp-server-list">
               {servers.map((server) => (
-                <button
-                  key={server.id}
-                  className={server.id === selectedServerId ? "mcp-server-item selected" : "mcp-server-item"}
-                  onClick={() => void onSelectServer(server)}
-                >
-                  <span className="mcp-server-item-title">{server.label}</span>
-                  <span className="mcp-server-item-meta">
-                    {server.enabled ? "Enabled" : "Disabled"} · {server.approval_mode}
-                  </span>
-                </button>
+                <div key={server.id} className={server.id === selectedServerId ? "entity-row selected" : "entity-row"}>
+                  <button className="entity-main" onClick={() => void onSelectServer(server)}>
+                    <strong>{server.label}</strong>
+                    <span>{server.enabled ? "Enabled" : "Disabled"} · {server.approval_mode}</span>
+                  </button>
+                  <div className="entity-actions">
+                    <button
+                      className="kebab-button secondary-button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        toggleMenu("servers", server.id);
+                      }}
+                      aria-label={`MCP server options for ${server.label}`}
+                    >
+                      ⋮
+                    </button>
+                    {openMenu?.section === "servers" && openMenu.id === server.id && (
+                      <div className="menu-popover">
+                        <button className="menu-item" onClick={() => void onSelectServer(server)}>Edit</button>
+                        <button className="menu-item danger" onClick={() => void onDeleteServer(server.id)}>Delete</button>
+                      </div>
+                    )}
+                  </div>
+                </div>
               ))}
-              <button className="mcp-add-button" onClick={onResetServerForm}>+ Add MCP Server</button>
             </div>
 
             <div className="mcp-editor">
@@ -646,35 +755,54 @@ export default function App() {
         <section className="chat-pane panel">
           <div className="panel-header">
             <h2>Threads</h2>
-            <button onClick={onCreateThread}>
-              New Thread
-            </button>
+            <button className="icon-button" onClick={onCreateThread} aria-label="Add thread">+</button>
           </div>
           <p className="helper-text">
             Profile: <strong>{selectedProfile?.name ?? "Draft profile"}</strong>
             {" · "}
             Thread: <strong>{selectedThread?.title ?? "No thread selected"}</strong>
           </p>
-          <div className="thread-strip">
+          <div className="entity-list thread-list">
             {threads.map((thread) => (
-              <div key={thread.id} className={thread.id === selectedThreadId ? "thread-pill selected" : "thread-pill"}>
+              <div key={thread.id} className={thread.id === selectedThreadId ? "entity-row selected" : "entity-row"}>
                 <button
-                  className="thread-chip"
+                  className="entity-main"
                   onClick={() => {
                     setSelectedThreadId(thread.id);
+                    closeMenu();
                     setStatusLine(`Selected ${thread.title}`);
                   }}
                 >
-                  {thread.title}
+                  <strong>{thread.title}</strong>
+                  <span>{new Date(thread.updated_at).toLocaleString()}</span>
                 </button>
-                <button
-                  className="thread-delete"
-                  onClick={() => void onDeleteThread(thread.id)}
-                  aria-label={`Delete ${thread.title}`}
-                  title={`Delete ${thread.title}`}
-                >
-                  Delete
-                </button>
+                <div className="entity-actions">
+                  <button
+                    className="kebab-button secondary-button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      toggleMenu("threads", thread.id);
+                    }}
+                    aria-label={`Thread options for ${thread.title}`}
+                  >
+                    ⋮
+                  </button>
+                  {openMenu?.section === "threads" && openMenu.id === thread.id && (
+                    <div className="menu-popover">
+                      <button
+                        className="menu-item"
+                        onClick={() => {
+                          setSelectedThreadId(thread.id);
+                          closeMenu();
+                          setStatusLine(`Selected ${thread.title}`);
+                        }}
+                      >
+                        Edit
+                      </button>
+                      <button className="menu-item danger" onClick={() => void onDeleteThread(thread.id)}>Delete</button>
+                    </div>
+                  )}
+                </div>
               </div>
             ))}
           </div>

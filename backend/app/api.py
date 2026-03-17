@@ -66,6 +66,16 @@ async def _test_server_config(server: MCPServer) -> dict[str, Any]:
     }
 
 
+def _delete_thread_records(db: Session, thread_id: str) -> None:
+    run_ids = [run_id for (run_id,) in db.query(AgentRun.id).filter(AgentRun.thread_id == thread_id).all()]
+    if run_ids:
+        db.execute(delete(TelemetryEvent).where(TelemetryEvent.run_id.in_(run_ids)))
+        db.execute(delete(RunStep).where(RunStep.run_id.in_(run_ids)))
+        db.execute(delete(ApprovalDecision).where(ApprovalDecision.run_id.in_(run_ids)))
+        db.execute(delete(AgentRun).where(AgentRun.id.in_(run_ids)))
+    db.execute(delete(Message).where(Message.thread_id == thread_id))
+
+
 @router.get("/health")
 def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
@@ -125,6 +135,22 @@ def update_agent_profile(
         raise HTTPException(status_code=409, detail="Agent profile update conflicts with an existing name")
     db.refresh(profile)
     return profile
+
+
+@router.delete("/agent-profiles/{profile_id}")
+def delete_agent_profile(profile_id: str, db: Session = Depends(get_db)) -> dict[str, bool]:
+    profile = db.query(AgentProfile).filter(AgentProfile.id == profile_id).one_or_none()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Agent profile not found")
+    thread_ids = [thread_id for (thread_id,) in db.query(Thread.id).filter(Thread.agent_profile_id == profile_id).all()]
+    for thread_id in thread_ids:
+        _delete_thread_records(db, thread_id)
+        thread = db.query(Thread).filter(Thread.id == thread_id).one_or_none()
+        if thread:
+            db.delete(thread)
+    db.delete(profile)
+    db.commit()
+    return {"ok": True}
 
 
 @router.post("/agent-profiles/import-agent-md")
@@ -245,6 +271,17 @@ def update_mcp_server(server_id: str, payload: MCPServerUpdate, db: Session = De
     return server
 
 
+@router.delete("/mcp-servers/{server_id}")
+def delete_mcp_server(server_id: str, db: Session = Depends(get_db)) -> dict[str, bool]:
+    server = db.query(MCPServer).filter(MCPServer.id == server_id).one_or_none()
+    if not server:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    db.execute(delete(ApprovalDecision).where(ApprovalDecision.mcp_server_id == server_id))
+    db.delete(server)
+    db.commit()
+    return {"ok": True}
+
+
 @router.post("/mcp-servers/{server_id}/test")
 async def test_mcp_server(server_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
     server = db.query(MCPServer).filter(MCPServer.id == server_id).one_or_none()
@@ -338,14 +375,7 @@ def delete_thread(thread_id: str, db: Session = Depends(get_db)) -> dict[str, bo
     thread = db.query(Thread).filter(Thread.id == thread_id).one_or_none()
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-
-    run_ids = [run_id for (run_id,) in db.query(AgentRun.id).filter(AgentRun.thread_id == thread_id).all()]
-    if run_ids:
-        db.execute(delete(TelemetryEvent).where(TelemetryEvent.run_id.in_(run_ids)))
-        db.execute(delete(RunStep).where(RunStep.run_id.in_(run_ids)))
-        db.execute(delete(ApprovalDecision).where(ApprovalDecision.run_id.in_(run_ids)))
-        db.execute(delete(AgentRun).where(AgentRun.id.in_(run_ids)))
-    db.execute(delete(Message).where(Message.thread_id == thread_id))
+    _delete_thread_records(db, thread_id)
     db.delete(thread)
     db.commit()
     return {"ok": True}

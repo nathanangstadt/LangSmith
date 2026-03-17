@@ -19,6 +19,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   listProfiles: () => request<AgentProfile[]>("/agent-profiles"),
+  deleteProfile: (profileId: string) => request<{ ok: boolean }>(`/agent-profiles/${profileId}`, { method: "DELETE" }),
   createProfile: (body: Record<string, unknown>) =>
     request<AgentProfile>("/agent-profiles", { method: "POST", body: JSON.stringify(body) }),
   updateProfile: (profileId: string, body: Record<string, unknown>) =>
@@ -32,6 +33,7 @@ export const api = {
     request<string>(`/agent-profiles/${profileId}/export-agent-md`, { headers: {} }),
   listServers: () => request<MCPServer[]>("/mcp-servers"),
   getServer: (serverId: string) => request<MCPServerDetail>(`/mcp-servers/${serverId}`),
+  deleteServer: (serverId: string) => request<{ ok: boolean }>(`/mcp-servers/${serverId}`, { method: "DELETE" }),
   createServer: (body: Record<string, unknown>) =>
     request<MCPServer>("/mcp-servers", { method: "POST", body: JSON.stringify(body) }),
   updateServer: (serverId: string, body: Record<string, unknown>) =>
