@@ -101,6 +101,10 @@ pre {
   min-width: 0;
 }
 
+.sidebar.has-open-menu {
+  overflow: visible;
+}
+
 .workspace {
   grid-template-columns: minmax(0, 1.6fr) minmax(240px, 0.85fr);
   min-width: 0;

@@ -612,7 +612,13 @@ export default function App() {
 
   return (
     <div className="shell">
-      <aside className="sidebar">
+      <aside
+        className={
+          openMenu && (openMenu.section === "profiles" || openMenu.section === "servers")
+            ? "sidebar has-open-menu"
+            : "sidebar"
+        }
+      >
         <section className="panel">
           <h1>Agent Playground</h1>
           <p className="muted">{statusLine}</p>
@@ -844,16 +850,6 @@ export default function App() {
                   </button>
                   {openMenu?.section === "threads" && openMenu.id === thread.id && (
                     <div className="menu-popover">
-                      <button
-                        className="menu-item"
-                        onClick={() => {
-                          setSelectedThreadId(thread.id);
-                          closeMenu();
-                          setStatusLine(`Selected ${thread.title}`);
-                        }}
-                      >
-                        Edit
-                      </button>
                       <button className="menu-item danger" onClick={() => void onDeleteThread(thread.id)}>Delete</button>
                     </div>
                   )}
