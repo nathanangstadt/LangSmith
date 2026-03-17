@@ -80,13 +80,18 @@ class AgentRuntime:
     def _conversation_input(self, messages: list[Message]) -> list[dict[str, Any]]:
         input_items = []
         for message in messages:
+            content_type = "output_text" if message.role == "assistant" else "input_text"
             input_items.append(
                 {
                     "role": message.role,
-                    "content": [{"type": "input_text", "text": message.content}],
+                    "content": [{"type": content_type, "text": message.content}],
                 }
             )
         return input_items
+
+    @staticmethod
+    def _supports_temperature(model_name: str) -> bool:
+        return not model_name.startswith("gpt-5")
 
     @traceable(run_type="chain", name="agent_playground.react_run")
     async def _call_openai(
@@ -104,11 +109,54 @@ class AgentRuntime:
             "model": model_name,
             "instructions": instructions,
             "input": input_items,
-            "temperature": temperature,
         }
+        if self._supports_temperature(model_name):
+            kwargs["temperature"] = temperature
         if tools:
             kwargs["tools"] = tools
         return await asyncio.to_thread(self.client.responses.create, **kwargs)
+
+    async def _call_openai_with_mcp_fallback(
+        self,
+        *,
+        db: Session,
+        run: AgentRun,
+        model_span: CanonicalSpan,
+        model_name: str,
+        instructions: str,
+        temperature: float,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> tuple[Any, bool]:
+        try:
+            response = await self._call_openai(
+                model_name=model_name,
+                instructions=instructions,
+                temperature=temperature,
+                input_items=input_items,
+                tools=tools,
+            )
+            return response, False
+        except Exception as exc:
+            message = str(exc)
+            if tools and ("Error retrieving tool list from MCP server" in message or "external_connector_error" in message):
+                telemetry_manager.record_event(
+                    db,
+                    run_id=run.id,
+                    trace_id=run.trace_id,
+                    span_id=model_span.span_id,
+                    event_type="mcp.fallback",
+                    payload={"reason": message, "skipped_servers": [tool.get("server_label") for tool in tools]},
+                )
+                response = await self._call_openai(
+                    model_name=model_name,
+                    instructions=instructions,
+                    temperature=temperature,
+                    input_items=input_items,
+                    tools=[],
+                )
+                return response, True
+            raise
 
     async def stream_run(
         self,
@@ -119,7 +167,8 @@ class AgentRuntime:
         user_message: Message,
         auto_servers: list[MCPServer],
         prompt_servers: list[MCPServer],
-    ) -> AsyncGenerator[str, None]:
+        ) -> AsyncGenerator[str, None]:
+        run = db.merge(run)
         root_span = telemetry_manager.start_span(
             run,
             name="react.run",
@@ -127,6 +176,7 @@ class AgentRuntime:
             attributes={"thread_id": thread.id, "agent_profile_id": profile.id},
             input_payload={"message_id": user_message.id, "content": user_message.content},
         )
+        model_span: CanonicalSpan | None = None
         try:
             approvals = await self.request_approvals_if_needed(db, run, prompt_servers)
             if self.approvals_denied(approvals):
@@ -211,7 +261,10 @@ class AgentRuntime:
                 input_payload={"tools": [tool["server_label"] for tool in tools]},
             )
             yield self._event("run.step.started", {"run_id": run.id, "kind": "model", "span_id": model_span.span_id})
-            response = await self._call_openai(
+            response, used_mcp_fallback = await self._call_openai_with_mcp_fallback(
+                db=db,
+                run=run,
+                model_span=model_span,
                 model_name=profile.model_name,
                 instructions=self._prompt(profile),
                 temperature=profile.temperature,
@@ -235,9 +288,10 @@ class AgentRuntime:
                     "response_id": response_id,
                     "output_text": output_text,
                     "token_meta": token_meta,
+                    "used_mcp_fallback": used_mcp_fallback,
                 },
                 token_usage=usage_payload,
-                metadata_json={"response_id": response_id},
+                metadata_json={"response_id": response_id, "used_mcp_fallback": used_mcp_fallback},
             )
             yield self._event(
                 "run.step.completed",
@@ -295,17 +349,50 @@ class AgentRuntime:
                 },
             )
         except Exception as exc:
+            error_message = str(exc)
             run.status = "failed"
+            failed_span = model_span or root_span
+            step = telemetry_manager.end_span(
+                db,
+                run,
+                failed_span,
+                step_index=99,
+                status="failed",
+                output_payload={"error": error_message},
+                metadata_json={"error_type": exc.__class__.__name__},
+            )
+            assistant_message = Message(
+                thread_id=thread.id,
+                role="assistant",
+                content=f"Runtime error: {error_message}",
+                metadata_json={"error": True},
+            )
+            db.add(assistant_message)
+            db.flush()
+            run.assistant_message_id = assistant_message.id
             telemetry_manager.record_event(
                 db,
                 run_id=run.id,
                 trace_id=run.trace_id,
                 span_id=root_span.span_id,
                 event_type="run.failed",
-                payload={"error": str(exc)},
+                payload={"error": error_message},
             )
             db.commit()
-            yield self._event("run.failed", {"run_id": run.id, "error": str(exc)})
+            yield self._event(
+                "run.failed",
+                {
+                    "run_id": run.id,
+                    "step_id": step.id,
+                    "error": error_message,
+                    "assistant_message": {
+                        "id": assistant_message.id,
+                        "thread_id": assistant_message.thread_id,
+                        "role": assistant_message.role,
+                        "content": assistant_message.content,
+                    },
+                },
+            )
 
     async def resume_run(self, db: Session, run: AgentRun) -> Message | None:
         thread = db.query(Thread).filter(Thread.id == run.thread_id).one()
@@ -327,4 +414,3 @@ class AgentRuntime:
 
 
 agent_runtime = AgentRuntime()
-

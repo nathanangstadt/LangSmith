@@ -37,6 +37,8 @@ const defaultMcpForm = {
   enabled: true,
 };
 
+type ThreadMessage = Thread["messages"][number];
+
 export default function App() {
   const [profiles, setProfiles] = useState<AgentProfile[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
@@ -49,7 +51,6 @@ export default function App() {
   const [telemetry, setTelemetry] = useState<RunTelemetry | null>(null);
   const [activeRunId, setActiveRunId] = useState<string>("");
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
-  const [agentMd, setAgentMd] = useState("");
   const [statusLine, setStatusLine] = useState("Idle");
   const [errorMessage, setErrorMessage] = useState("");
   const [serverTestResult, setServerTestResult] = useState<string>("");
@@ -109,6 +110,7 @@ export default function App() {
 
   const selectedThread = threads.find((thread) => thread.id === selectedThreadId);
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId);
+  const temperatureDisabled = profileForm.model_name.startsWith("gpt-5");
 
   useEffect(() => {
     if (!selectedProfile) return;
@@ -137,9 +139,44 @@ export default function App() {
   }, [selectedProfileId, selectedProfile]);
 
   const handleError = (error: unknown, fallback: string) => {
-    const message = error instanceof Error ? error.message : fallback;
+    const rawMessage = error instanceof Error ? error.message : fallback;
+    let message = rawMessage || fallback;
+    try {
+      const parsed = JSON.parse(rawMessage);
+      if (typeof parsed?.detail === "string") {
+        message = parsed.detail;
+      } else if (typeof parsed?.error === "string") {
+        message = parsed.error;
+      }
+    } catch {
+      message = rawMessage || fallback;
+    }
     setErrorMessage(message || fallback);
     setStatusLine("Action failed");
+  };
+
+  const upsertThread = (thread: Thread) => {
+    setThreads((current) => {
+      const existingIndex = current.findIndex((item) => item.id === thread.id);
+      if (existingIndex === -1) return [thread, ...current];
+      const next = [...current];
+      next[existingIndex] = thread;
+      return next;
+    });
+  };
+
+  const appendMessageToThread = (threadId: string, message: ThreadMessage) => {
+    setThreads((current) =>
+      current.map((thread) => {
+        if (thread.id !== threadId) return thread;
+        const existingIndex = thread.messages.findIndex((item) => item.id === message.id);
+        const messages =
+          existingIndex === -1
+            ? [...thread.messages, message]
+            : thread.messages.map((item) => (item.id === message.id ? message : item));
+        return { ...thread, messages, updated_at: new Date().toISOString() };
+      }),
+    );
   };
 
   const onProfileField = (key: string, value: string | number) => {
@@ -230,31 +267,6 @@ export default function App() {
     }
   };
 
-  const onImportAgentMd = async () => {
-    if (!agentMd.trim()) return;
-    setErrorMessage("");
-    try {
-      const result = await api.importAgentMd(agentMd);
-      setSelectedProfileId(result.profile.id);
-      setStatusLine(`Imported agent.md into profile ${result.profile.name}`);
-      await refreshAll();
-    } catch (error) {
-      handleError(error, "Unable to import agent.md");
-    }
-  };
-
-  const onExportAgentMd = async () => {
-    if (!selectedProfileId) return;
-    setErrorMessage("");
-    try {
-      const content = await api.exportAgentMd(selectedProfileId);
-      setAgentMd(content);
-      setStatusLine("Exported agent.md for the selected profile");
-    } catch (error) {
-      handleError(error, "Unable to export agent.md");
-    }
-  };
-
   const onSendMessage = async () => {
     if (!chatInput.trim()) {
       setStatusLine("Enter a message first");
@@ -265,33 +277,57 @@ export default function App() {
       const { threadId } = await ensureProfileAndThread();
       const content = chatInput;
       setChatInput("");
+      setSelectedThreadId(threadId);
+      appendMessageToThread(threadId, {
+        id: `pending-user-${Date.now()}`,
+        thread_id: threadId,
+        role: "user",
+        content,
+        metadata_json: {},
+        created_at: new Date().toISOString(),
+      });
       setStatusLine("Running agent");
       await refreshAll();
       await api.streamMessage(threadId, content, (eventName, payload) => {
+        const runId = String(payload.run_id ?? "");
+        if (runId) setActiveRunId(runId);
+        if (eventName === "run.step.started" || eventName === "run.step.completed") {
+          setStatusLine(`Run ${String(payload.kind ?? "step")}`);
+          if (runId) void refreshTelemetry(runId);
+        }
         if (eventName === "run.approval.requested") {
           setPendingApprovals((current) => [...current, payload as unknown as PendingApproval]);
-          setActiveRunId(String(payload.run_id));
           setStatusLine("Waiting for MCP approval");
+          if (runId) void refreshTelemetry(runId);
         }
         if (eventName === "message.delta") {
-          void api.getThread(threadId).then((thread) => {
-            setThreads((current) => {
-              const existing = current.some((item) => item.id === thread.id);
-              if (!existing) return [thread, ...current];
-              return current.map((item) => (item.id === thread.id ? thread : item));
-            });
+          appendMessageToThread(threadId, {
+            id: String(payload.message_id),
+            thread_id: threadId,
+            role: "assistant",
+            content: String(payload.delta ?? ""),
+            metadata_json: {},
+            created_at: new Date().toISOString(),
           });
         }
         if (eventName === "run.completed") {
-          setActiveRunId(String(payload.run_id));
           setStatusLine("Run completed");
-          void refreshAll();
-          void refreshTelemetry(String(payload.run_id));
+          const assistantMessage = payload.assistant_message as ThreadMessage | undefined;
+          if (assistantMessage) appendMessageToThread(threadId, assistantMessage);
+          void api.getThread(threadId).then(upsertThread);
+          if (runId) void refreshTelemetry(runId);
         }
         if (eventName === "run.failed") {
           setStatusLine(String(payload.error ?? "Run failed"));
+          setErrorMessage(String(payload.error ?? "Run failed"));
+          const assistantMessage = payload.assistant_message as ThreadMessage | undefined;
+          if (assistantMessage) appendMessageToThread(threadId, assistantMessage);
+          void api.getThread(threadId).then(upsertThread);
+          if (runId) void refreshTelemetry(runId);
         }
       });
+      const updatedThread = await api.getThread(threadId);
+      upsertThread(updatedThread);
       await refreshAll();
     } catch (error) {
       handleError(error, "Unable to send the message");
@@ -354,7 +390,9 @@ export default function App() {
             step={0.1}
             value={profileForm.temperature}
             onChange={(e) => onProfileField("temperature", Number(e.target.value))}
+            disabled={temperatureDisabled}
           />
+          {temperatureDisabled && <p className="helper-text">This model ignores temperature, so the runtime omits it.</p>}
           <label>Max iterations</label>
           <input
             type="number"
@@ -432,16 +470,6 @@ export default function App() {
           </div>
         </section>
 
-        <section className="panel">
-          <div className="panel-header">
-            <h2>agent.md</h2>
-            <div className="row-actions">
-              <button onClick={onImportAgentMd}>Import</button>
-              <button onClick={onExportAgentMd}>Export</button>
-            </div>
-          </div>
-          <textarea value={agentMd} onChange={(e) => setAgentMd(e.target.value)} rows={12} />
-        </section>
       </aside>
 
       <main className="workspace">
@@ -501,7 +529,7 @@ export default function App() {
 
           <div className="composer">
             <textarea value={chatInput} onChange={(e) => setChatInput(e.target.value)} rows={4} placeholder="Chat with the agent" />
-            <button onClick={onSendMessage} disabled={!selectedThreadId}>
+            <button onClick={onSendMessage}>
               Send
             </button>
           </div>
@@ -515,7 +543,7 @@ export default function App() {
               <span className="badge">LangSmith</span>
               <span className="badge">OTEL</span>
               {activeRunId && (
-                <button onClick={() => void refreshTelemetry(activeRunId)}>
+                <button className="secondary-button" onClick={() => void refreshTelemetry(activeRunId)}>
                   Refresh
                 </button>
               )}
