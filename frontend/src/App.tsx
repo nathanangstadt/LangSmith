@@ -126,6 +126,11 @@ export default function App() {
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId);
   const selectedServer = servers.find((server) => server.id === selectedServerId);
   const temperatureDisabled = profileForm.model_name.startsWith("gpt-5");
+  const formatStepName = (value: string) =>
+    value
+      .split(".")
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join(" / ");
 
   useEffect(() => {
     if (!selectedProfile) return;
@@ -903,16 +908,24 @@ export default function App() {
           <div className="panel-header">
             <h2>Telemetry</h2>
             <div className="row-actions">
-              <span className="badge">local</span>
-              <span className="badge">LangSmith</span>
-              <span className="badge">OTEL</span>
+              <span className="badge" title="Stored in this app's local database so you can inspect the run here.">Local</span>
+              <span className="badge" title="LangSmith export target when LangSmith tracing is configured for the runtime.">LangSmith</span>
+              <span className="badge" title="OpenTelemetry or OTLP export target when telemetry export is configured.">OTEL</span>
               {activeRunId && (
-                <button className="secondary-button" onClick={() => void refreshTelemetry(activeRunId)}>
+                <button
+                  className="secondary-button"
+                  title="Reload the current run's telemetry from the backend."
+                  onClick={() => void refreshTelemetry(activeRunId)}
+                >
                   Refresh
                 </button>
               )}
             </div>
           </div>
+          <p className="helper-text telemetry-help">
+            Local stores telemetry in this app. LangSmith and OTEL are external export targets when configured.
+            Refresh reloads the current run from the backend.
+          </p>
           {telemetry ? (
             <>
               <div className="telemetry-summary">
@@ -925,8 +938,8 @@ export default function App() {
                 {telemetry.steps.map((step) => (
                   <article key={step.id} className="timeline-card">
                     <header>
-                      <strong>{step.step_index}. {step.name}</strong>
-                      <span>{step.kind}</span>
+                      <strong>{step.step_index}. {formatStepName(step.name)}</strong>
+                      <span className="timeline-kind">{step.kind}</span>
                     </header>
                     <p>Status: {step.status}</p>
                     <p>Latency: {step.latency_ms ?? "n/a"} ms</p>

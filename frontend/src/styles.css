@@ -271,6 +271,20 @@ button.list-item {
   gap: 0.45rem;
 }
 
+.timeline-card header,
+.approval-card header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.timeline-card header strong,
+.approval-card header strong {
+  min-width: 0;
+}
+
 .mcp-manager {
   display: grid;
   gap: 0.85rem;
@@ -437,6 +451,17 @@ button.list-item {
   font-size: 0.85rem;
 }
 
+.timeline-kind {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: #e6edf6;
+  color: #35506a;
+  font-size: 0.78rem;
+  text-transform: capitalize;
+}
+
 .helper-text {
   margin: 0.35rem 0 0;
   color: #52606d;
@@ -469,6 +494,10 @@ button.list-item {
   display: grid;
   gap: 0.4rem;
   margin-bottom: 1rem;
+}
+
+.telemetry-help {
+  margin: 0 0 0.85rem;
 }
 
 .timeline-card.warning {
