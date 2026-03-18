@@ -437,7 +437,8 @@ button.list-item {
 }
 
 .message.tool_request {
-  background: #eef6ff;
+  background: #f5ecff;
+  border-color: rgba(108, 78, 166, 0.18);
 }
 
 .message.tool_response {
