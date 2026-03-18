@@ -387,6 +387,20 @@ def delete_thread(thread_id: str, db: Session = Depends(get_db)) -> dict[str, bo
     return {"ok": True}
 
 
+@router.get("/threads/{thread_id}/runs")
+def list_thread_runs(thread_id: str, db: Session = Depends(get_db)) -> list[dict]:
+    thread = db.query(Thread).filter(Thread.id == thread_id).one_or_none()
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    runs = (
+        db.query(AgentRun)
+        .filter(AgentRun.thread_id == thread_id)
+        .order_by(AgentRun.created_at.desc())
+        .all()
+    )
+    return [{"id": run.id, "status": run.status, "created_at": run.created_at.isoformat()} for run in runs]
+
+
 @router.post("/threads/{thread_id}/messages")
 async def create_message_and_run(
     thread_id: str,

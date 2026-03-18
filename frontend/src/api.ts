@@ -43,6 +43,7 @@ export const api = {
   testServer: (serverId: string) => request<Record<string, unknown>>(`/mcp-servers/${serverId}/test`, { method: "POST" }),
   listThreads: () => request<Thread[]>("/threads"),
   getThread: (threadId: string) => request<Thread>(`/threads/${threadId}`),
+  listRuns: (threadId: string) => request<{ id: string; status: string; created_at: string }[]>(`/threads/${threadId}/runs`),
   createThread: (body: Record<string, unknown>) =>
     request<Thread>("/threads", { method: "POST", body: JSON.stringify(body) }),
   deleteThread: (threadId: string) => request<{ ok: boolean }>(`/threads/${threadId}`, { method: "DELETE" }),

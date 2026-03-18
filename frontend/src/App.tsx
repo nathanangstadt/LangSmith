@@ -198,6 +198,19 @@ export default function App() {
     }
   }, [selectedThreadId, selectedThread, waitingThreadId]);
 
+  useEffect(() => {
+    if (!selectedThreadId || waitingThreadId === selectedThreadId) return;
+    api.listRuns(selectedThreadId).then((runs) => {
+      if (runs.length > 0) {
+        setActiveRunId(runs[0].id);
+        void refreshTelemetry(runs[0].id);
+      } else {
+        setActiveRunId("");
+        setTelemetry(null);
+      }
+    }).catch(() => {});
+  }, [selectedThreadId]);
+
   const handleError = (error: unknown, fallback: string) => {
     const rawMessage = error instanceof Error ? error.message : fallback;
     let message = rawMessage || fallback;
@@ -941,12 +954,12 @@ export default function App() {
           <label>Model</label>
           <select value={profileForm.model_name} onChange={(e) => onProfileField("model_name", e.target.value)}>
             <optgroup label="GPT-4o">
-              <option value="gpt-4o-mini">gpt-4o-mini (cheap)</option>
+              <option value="gpt-4o-mini">gpt-4o-mini</option>
               <option value="gpt-4o">gpt-4o</option>
             </optgroup>
             <optgroup label="GPT-4.1">
-              <option value="gpt-4.1-mini">gpt-4.1-mini (cheap)</option>
-              <option value="gpt-4.1-nano">gpt-4.1-nano (cheapest)</option>
+              <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+              <option value="gpt-4.1-nano">gpt-4.1-nano</option>
               <option value="gpt-4.1">gpt-4.1</option>
             </optgroup>
             <optgroup label="GPT-5 (MCP native)">
@@ -955,8 +968,8 @@ export default function App() {
               <option value="gpt-5.4">gpt-5.4</option>
             </optgroup>
             <optgroup label="Reasoning (o-series)">
-              <option value="o4-mini">o4-mini (cheap)</option>
-              <option value="o3-mini">o3-mini (cheap)</option>
+              <option value="o4-mini">o4-mini</option>
+              <option value="o3-mini">o3-mini</option>
               <option value="o3">o3</option>
             </optgroup>
           </select>
