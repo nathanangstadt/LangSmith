@@ -101,7 +101,7 @@ class GatedOTLPExporter(SpanExporter):
     def __init__(self, inner: OTLPSpanExporter) -> None:
         self._inner = inner
         self._lock = threading.Lock()
-        self._active: bool = False
+        self._active: bool = True
 
     @property
     def active(self) -> bool:
