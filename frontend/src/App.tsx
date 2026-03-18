@@ -54,6 +54,7 @@ type DetailedActivityItem = {
   subtitle: string;
   body?: string;
   raw: Record<string, unknown>;
+  order?: number;
 };
 
 export default function App() {
@@ -78,6 +79,7 @@ export default function App() {
   const [statusLine, setStatusLine] = useState("Idle");
   const [errorMessage, setErrorMessage] = useState("");
   const [serverTestState, setServerTestState] = useState<ServerTestState>({ status: "idle", message: "", tools: [] });
+  const [liveDetailedActivity, setLiveDetailedActivity] = useState<DetailedActivityItem[]>([]);
 
   useEffect(() => {
     void initializeWorkspace();
@@ -227,6 +229,17 @@ export default function App() {
     );
   };
 
+  const upsertStreamingAssistantMessage = (threadId: string, messageId: string, snapshot: string) => {
+    appendMessageToThread(threadId, {
+      id: messageId,
+      thread_id: threadId,
+      role: "assistant",
+      content: snapshot,
+      metadata_json: { streaming: true },
+      created_at: new Date().toISOString(),
+    });
+  };
+
   const ensureThreadInState = (threadId: string, agentProfileId: string, title: string) => {
     setThreads((current) => {
       if (current.some((thread) => thread.id === threadId)) return current;
@@ -256,6 +269,103 @@ export default function App() {
         [key]: value,
       },
     }));
+  };
+
+  const buildDetailedItems = (
+    item: Record<string, unknown>,
+    fallbackKey: string,
+    order?: number,
+  ): DetailedActivityItem[] => {
+    const type = String(item.type ?? "event");
+    const itemKey = String(item.id ?? fallbackKey);
+    if (type === "reasoning") {
+      const summaries = Array.isArray(item.summary) ? item.summary : [];
+      const summaryText = summaries
+        .map((entry) => {
+          if (typeof entry === "string") return entry;
+          if (entry && typeof entry === "object" && "text" in entry) return String(entry.text ?? "");
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n");
+      if (!summaryText) return [];
+      return [{
+        key: itemKey,
+        title: "Reasoning Summary",
+        subtitle: "Model",
+        body: summaryText,
+        raw: item,
+        order,
+      }];
+    }
+    if (type === "mcp_list_tools") {
+      const tools = Array.isArray(item.tools) ? item.tools : [];
+      const toolNames = tools
+        .map((tool) => (tool && typeof tool === "object" ? String(tool.name ?? "unknown") : "unknown"))
+        .join(", ");
+      return [{
+        key: itemKey,
+        title: "Imported MCP Tools",
+        subtitle: String(item.server_label ?? "MCP server"),
+        body: toolNames || "Loading tools...",
+        raw: item,
+        order,
+      }];
+    }
+    if (type === "mcp_call") {
+      const status = String(item.status ?? "in_progress");
+      const output = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? {}, null, 2);
+      const argumentsText = typeof item.arguments === "string" ? item.arguments : "";
+      return [{
+        key: itemKey,
+        title: `Tool Call: ${String(item.name ?? "unknown")}`,
+        subtitle: `${String(item.server_label ?? "MCP")} · ${status}`,
+        body: output || argumentsText || "Calling tool...",
+        raw: item,
+        order,
+      }];
+    }
+    if (type === "message") {
+      const content = Array.isArray(item.content)
+        ? item.content
+            .map((entry) => {
+              if (!entry || typeof entry !== "object") return "";
+              return String(entry.text ?? "");
+            })
+            .filter(Boolean)
+            .join("\n")
+        : "";
+      return [{
+        key: itemKey,
+        title: "Assistant Output",
+        subtitle: String(item.status ?? "completed"),
+        body: content,
+        raw: item,
+        order,
+      }];
+    }
+    return [{
+      key: itemKey,
+      title: `Response Item: ${type}`,
+      subtitle: "Model",
+      raw: item,
+      order,
+    }];
+  };
+
+  const upsertLiveDetailedItems = (items: DetailedActivityItem[]) => {
+    setLiveDetailedActivity((current) => {
+      const next = [...current];
+      for (const item of items) {
+        const index = next.findIndex((entry) => entry.key === item.key);
+        if (index === -1) {
+          next.push(item);
+          continue;
+        }
+        next[index] = item;
+      }
+      return next.sort((left, right) => (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER));
+    });
   };
 
   const toggleMenu = (section: "profiles" | "threads" | "servers", id: string) => {
@@ -555,6 +665,7 @@ export default function App() {
       return;
     }
     setErrorMessage("");
+    setLiveDetailedActivity([]);
     try {
       const { profileId, threadId, threadTitle } = await ensureProfileAndThread();
       const content = chatInput;
@@ -578,20 +689,48 @@ export default function App() {
           setStatusLine(`Run ${String(payload.kind ?? "step")}`);
           if (runId) void refreshTelemetry(runId);
         }
+        if (eventName === "run.detail.item") {
+          const item = payload.item;
+          if (item && typeof item === "object") {
+            upsertLiveDetailedItems(
+              buildDetailedItems(
+                item as Record<string, unknown>,
+                `${String(payload.output_index ?? "item")}`,
+                Number(payload.sequence_number ?? Number.MAX_SAFE_INTEGER),
+              ),
+            );
+          }
+        }
+        if (eventName === "run.detail.text") {
+          const snapshot = String(payload.snapshot ?? "");
+          const itemId = String(payload.item_id ?? `message-${runId}`);
+          if (snapshot) {
+            upsertLiveDetailedItems([{
+              key: itemId,
+              title: "Assistant Output",
+              subtitle: "Streaming",
+              body: snapshot,
+              raw: {
+                type: "message",
+                id: itemId,
+                status: "in_progress",
+                content: [{ type: "output_text", text: snapshot }],
+              },
+              order: Number.MAX_SAFE_INTEGER - 1,
+            }]);
+          }
+        }
         if (eventName === "run.approval.requested") {
           setPendingApprovals((current) => [...current, payload as unknown as PendingApproval]);
           setStatusLine("Waiting for MCP approval");
           if (runId) void refreshTelemetry(runId);
         }
         if (eventName === "message.delta") {
-          appendMessageToThread(threadId, {
-            id: String(payload.message_id),
-            thread_id: threadId,
-            role: "assistant",
-            content: String(payload.delta ?? ""),
-            metadata_json: {},
-            created_at: new Date().toISOString(),
-          });
+          upsertStreamingAssistantMessage(
+            threadId,
+            String(payload.message_id),
+            String(payload.snapshot ?? payload.delta ?? ""),
+          );
         }
         if (eventName === "run.completed") {
           setWaitingThreadId("");
@@ -639,7 +778,7 @@ export default function App() {
     }
   };
 
-  const detailedActivity: DetailedActivityItem[] =
+  const persistedDetailedActivity: DetailedActivityItem[] =
     detailedMessagesEnabled && telemetry?.run.thread_id === selectedThreadId
       ? telemetry.steps.flatMap<DetailedActivityItem>((step) => {
           if (step.kind !== "model") return [];
@@ -647,77 +786,18 @@ export default function App() {
             ? (step.output_payload.response_items as Record<string, unknown>[])
             : [];
           return responseItems.flatMap<DetailedActivityItem>((item, index) => {
-            const type = String(item.type ?? "event");
-            if (type === "reasoning") {
-              const summaries = Array.isArray(item.summary) ? item.summary : [];
-              const summaryText = summaries
-                .map((entry) => {
-                  if (typeof entry === "string") return entry;
-                  if (entry && typeof entry === "object" && "text" in entry) return String(entry.text ?? "");
-                  return "";
-                })
-                .filter(Boolean)
-                .join("\n");
-              if (!summaryText) return [];
-              return [{
-                key: `${step.id}-${index}`,
-                title: "Reasoning Summary",
-                subtitle: "Model",
-                body: summaryText,
-                raw: item,
-              }];
-            }
-            if (type === "mcp_list_tools") {
-              const tools = Array.isArray(item.tools) ? item.tools : [];
-              const toolNames = tools
-                .map((tool) => (tool && typeof tool === "object" ? String(tool.name ?? "unknown") : "unknown"))
-                .join(", ");
-              return [{
-                key: `${step.id}-${index}`,
-                title: "Imported MCP Tools",
-                subtitle: String(item.server_label ?? "MCP server"),
-                body: toolNames || "No tools returned.",
-                raw: item,
-              }];
-            }
-            if (type === "mcp_call") {
-              const output = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? {}, null, 2);
-              return [{
-                key: `${step.id}-${index}`,
-                title: `Tool Call: ${String(item.name ?? "unknown")}`,
-                subtitle: `${String(item.server_label ?? "MCP")} · ${String(item.status ?? "completed")}`,
-                body: output,
-                raw: item,
-              }];
-            }
-            if (type === "message") {
-              const content = Array.isArray(item.content)
-                ? item.content
-                    .map((entry) => {
-                      if (!entry || typeof entry !== "object") return "";
-                      return String(entry.text ?? "");
-                    })
-                    .filter(Boolean)
-                    .join("\n")
-                : "";
-              return [{
-                key: `${step.id}-${index}`,
-                title: "Assistant Output",
-                subtitle: String(item.status ?? "completed"),
-                body: content,
-                raw: item,
-              }];
-            }
-            return [{
-              key: `${step.id}-${index}`,
-              title: `Response Item: ${type}`,
-              subtitle: "Model",
-              body: undefined,
-              raw: item,
-            }];
+            return buildDetailedItems(item, `${step.id}-${index}`, step.step_index * 1000 + index);
           });
         })
       : [];
+
+  const detailedActivity: DetailedActivityItem[] = detailedMessagesEnabled
+    ? Array.from(new Map([...liveDetailedActivity, ...persistedDetailedActivity].map((item) => [item.key, item])).values())
+    : [];
+
+  const hasStreamingAssistantMessage = Boolean(
+    selectedThread?.messages.some((message) => message.role === "assistant" && Boolean(message.metadata_json?.streaming)),
+  );
 
   return (
     <div className="shell">
@@ -984,7 +1064,7 @@ export default function App() {
                 <pre>{message.content}</pre>
               </article>
             ))}
-            {waitingThreadId === selectedThreadId && (
+            {waitingThreadId === selectedThreadId && !hasStreamingAssistantMessage && (
               <article className="message assistant waiting">
                 <header>assistant</header>
                 <pre>Thinking...</pre>

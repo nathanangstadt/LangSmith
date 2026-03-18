@@ -1,7 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from langsmith import traceable
 from langsmith.wrappers import wrap_openai
@@ -90,20 +90,94 @@ class AgentRuntime:
         return input_items
 
     @staticmethod
-    def _response_output_items(response: Any) -> list[dict[str, Any]]:
-        try:
-            payload = response.model_dump()
-        except Exception:
-            return []
+    def _safe_model_dump(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, list):
+            return [AgentRuntime._safe_model_dump(item) for item in value]
+        if isinstance(value, tuple):
+            return [AgentRuntime._safe_model_dump(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): AgentRuntime._safe_model_dump(item) for key, item in value.items()}
+        if hasattr(value, "model_dump"):
+            try:
+                return AgentRuntime._safe_model_dump(value.model_dump(mode="json"))
+            except TypeError:
+                return AgentRuntime._safe_model_dump(value.model_dump())
+            except Exception:
+                return str(value)
+        return str(value)
+
+    @staticmethod
+    def _serialize_stream_event(event: Any) -> dict[str, Any] | None:
+        event_type = getattr(event, "type", "")
+        base_payload = {
+            "type": event_type,
+            "sequence_number": getattr(event, "sequence_number", None),
+            "output_index": getattr(event, "output_index", None),
+        }
+        if event_type in {"response.output_item.added", "response.output_item.done"}:
+            return {
+                **base_payload,
+                "item": AgentRuntime._safe_model_dump(getattr(event, "item", None)),
+            }
+        if event_type == "response.output_text.delta":
+            return {
+                **base_payload,
+                "item_id": getattr(event, "item_id", None),
+                "content_index": getattr(event, "content_index", None),
+                "delta": getattr(event, "delta", ""),
+                "snapshot": getattr(event, "snapshot", ""),
+            }
+        if event_type == "response.output_text.done":
+            return {
+                **base_payload,
+                "item_id": getattr(event, "item_id", None),
+                "content_index": getattr(event, "content_index", None),
+                "text": getattr(event, "text", ""),
+            }
+        return None
+
+    @staticmethod
+    def _response_text_from_payload(payload: dict[str, Any]) -> str:
+        direct_text = payload.get("output_text")
+        if isinstance(direct_text, str) and direct_text:
+            return direct_text
         output = payload.get("output", [])
-        return output if isinstance(output, list) else []
+        if not isinstance(output, list):
+            return ""
+        parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            content = item.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for entry in content:
+                if not isinstance(entry, dict):
+                    continue
+                text = entry.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _response_usage_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            return {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+        return {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        }
 
     @staticmethod
     def _supports_temperature(model_name: str) -> bool:
         return not model_name.startswith("gpt-5")
 
     @traceable(run_type="chain", name="agent_playground.react_run")
-    async def _call_openai(
+    async def _call_openai_streaming(
         self,
         *,
         model_name: str,
@@ -111,7 +185,8 @@ class AgentRuntime:
         temperature: float,
         input_items: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-    ) -> Any:
+        on_event: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> dict[str, Any]:
         if not self.client:
             raise RuntimeErrorResponse("OPENAI_API_KEY is not configured.")
         kwargs = {
@@ -123,7 +198,50 @@ class AgentRuntime:
             kwargs["temperature"] = temperature
         if tools:
             kwargs["tools"] = tools
-        return await asyncio.to_thread(self.client.responses.create, **kwargs)
+
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def producer() -> None:
+            try:
+                with self.client.responses.stream(**kwargs) as stream:
+                    for event in stream:
+                        payload = self._serialize_stream_event(event)
+                        if payload is not None:
+                            loop.call_soon_threadsafe(queue.put_nowait, payload)
+                    final_response = stream.get_final_response()
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        {"type": "response.completed", "response": self._safe_model_dump(final_response)},
+                    )
+            except Exception as exc:
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    {"type": "response.error", "error": str(exc), "error_type": exc.__class__.__name__},
+                )
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, {"type": "__done__"})
+
+        task = asyncio.create_task(asyncio.to_thread(producer))
+        final_payload: dict[str, Any] | None = None
+        try:
+            while True:
+                stream_event = await queue.get()
+                event_type = stream_event.get("type")
+                if event_type == "__done__":
+                    break
+                if event_type == "response.error":
+                    raise RuntimeErrorResponse(str(stream_event.get("error", "OpenAI streaming failed")))
+                if event_type == "response.completed":
+                    response = stream_event.get("response", {})
+                    final_payload = response if isinstance(response, dict) else {}
+                    continue
+                await on_event(stream_event)
+        finally:
+            await task
+        if final_payload is None:
+            raise RuntimeErrorResponse("OpenAI returned no final response.")
+        return final_payload
 
     async def _call_openai_with_mcp_fallback(
         self,
@@ -136,14 +254,16 @@ class AgentRuntime:
         temperature: float,
         input_items: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-    ) -> tuple[Any, bool]:
+        on_event: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> tuple[dict[str, Any], bool]:
         try:
-            response = await self._call_openai(
+            response = await self._call_openai_streaming(
                 model_name=model_name,
                 instructions=instructions,
                 temperature=temperature,
                 input_items=input_items,
                 tools=tools,
+                on_event=on_event,
             )
             return response, False
         except Exception as exc:
@@ -157,12 +277,13 @@ class AgentRuntime:
                     event_type="mcp.fallback",
                     payload={"reason": message, "skipped_servers": [tool.get("server_label") for tool in tools]},
                 )
-                response = await self._call_openai(
+                response = await self._call_openai_streaming(
                     model_name=model_name,
                     instructions=instructions,
                     temperature=temperature,
                     input_items=input_items,
                     tools=[],
+                    on_event=on_event,
                 )
                 return response, True
             raise
@@ -186,6 +307,7 @@ class AgentRuntime:
             input_payload={"message_id": user_message.id, "content": user_message.content},
         )
         model_span: CanonicalSpan | None = None
+        assistant_message: Message | None = None
         try:
             approvals = await self.request_approvals_if_needed(db, run, prompt_servers)
             if self.approvals_denied(approvals):
@@ -269,26 +391,97 @@ class AgentRuntime:
                 attributes={"model": profile.model_name, "tool_count": len(tools)},
                 input_payload={"tools": [tool["server_label"] for tool in tools]},
             )
-            yield self._event("run.step.started", {"run_id": run.id, "kind": "model", "span_id": model_span.span_id})
-            response, used_mcp_fallback = await self._call_openai_with_mcp_fallback(
-                db=db,
-                run=run,
-                model_span=model_span,
-                model_name=profile.model_name,
-                instructions=self._prompt(profile),
-                temperature=profile.temperature,
-                input_items=self._conversation_input(messages),
-                tools=tools,
+            assistant_message = Message(
+                thread_id=thread.id,
+                role="assistant",
+                content="",
+                metadata_json={"streaming": True},
             )
-            output_text = getattr(response, "output_text", "") or ""
-            usage = getattr(response, "usage", None)
-            usage_payload = {
-                "input_tokens": getattr(usage, "input_tokens", None) if usage else None,
-                "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
-                "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
-            }
-            response_id = getattr(response, "id", None)
-            response_output_items = self._response_output_items(response)
+            db.add(assistant_message)
+            db.flush()
+            run.assistant_message_id = assistant_message.id
+            yield self._event("run.step.started", {"run_id": run.id, "kind": "model", "span_id": model_span.span_id})
+            streamed_output_text = ""
+            queued_events: asyncio.Queue[str] = asyncio.Queue()
+
+            async def on_stream_event(stream_event: dict[str, Any]) -> None:
+                nonlocal streamed_output_text
+                event_type = str(stream_event.get("type", ""))
+                telemetry_manager.record_event(
+                    db,
+                    run_id=run.id,
+                    trace_id=run.trace_id,
+                    span_id=model_span.span_id,
+                    event_type=event_type,
+                    payload=stream_event,
+                )
+                if event_type in {"response.output_item.added", "response.output_item.done"}:
+                    await queued_events.put(
+                        self._event(
+                            "run.detail.item",
+                            {
+                                "run_id": run.id,
+                                "kind": "model",
+                                **stream_event,
+                            },
+                        )
+                    )
+                    return
+                if event_type == "response.output_text.delta":
+                    snapshot = str(stream_event.get("snapshot") or "")
+                    delta = str(stream_event.get("delta") or "")
+                    streamed_output_text = snapshot or f"{streamed_output_text}{delta}"
+                    await queued_events.put(
+                        self._event(
+                            "message.delta",
+                            {
+                                "run_id": run.id,
+                                "message_id": assistant_message.id,
+                                "delta": delta,
+                                "snapshot": streamed_output_text,
+                            },
+                        )
+                    )
+                    await queued_events.put(
+                        self._event(
+                            "run.detail.text",
+                            {
+                                "run_id": run.id,
+                                "kind": "model",
+                                "item_id": stream_event.get("item_id"),
+                                "snapshot": streamed_output_text,
+                            },
+                        )
+                    )
+                    return
+                if event_type == "response.output_text.done":
+                    streamed_output_text = str(stream_event.get("text") or streamed_output_text)
+
+            model_call = asyncio.create_task(
+                self._call_openai_with_mcp_fallback(
+                    db=db,
+                    run=run,
+                    model_span=model_span,
+                    model_name=profile.model_name,
+                    instructions=self._prompt(profile),
+                    temperature=profile.temperature,
+                    input_items=self._conversation_input(messages),
+                    tools=tools,
+                    on_event=on_stream_event,
+                )
+            )
+            while not model_call.done() or not queued_events.empty():
+                if queued_events.empty():
+                    await asyncio.sleep(0.02)
+                    continue
+                yield await queued_events.get()
+            response, used_mcp_fallback = await model_call
+            output_text = self._response_text_from_payload(response) or streamed_output_text
+            usage_payload = self._response_usage_payload(response)
+            response_id = response.get("id")
+            response_output_items = response.get("output", [])
+            if not isinstance(response_output_items, list):
+                response_output_items = []
             model_step = telemetry_manager.end_span(
                 db,
                 run,
@@ -309,15 +502,8 @@ class AgentRuntime:
                 {"run_id": run.id, "kind": "model", "step_id": model_step.id, "usage": usage_payload},
             )
 
-            assistant_message = Message(
-                thread_id=thread.id,
-                role="assistant",
-                content=output_text or "(empty response)",
-                metadata_json={"response_id": response_id},
-            )
-            db.add(assistant_message)
-            db.flush()
-            run.assistant_message_id = assistant_message.id
+            assistant_message.content = output_text or "(empty response)"
+            assistant_message.metadata_json = {"response_id": response_id}
             run.status = "completed"
 
             final_span = telemetry_manager.start_span(
@@ -341,10 +527,16 @@ class AgentRuntime:
                 output_payload={"status": "completed", "assistant_message_id": assistant_message.id},
             )
             db.commit()
-            yield self._event(
-                "message.delta",
-                {"run_id": run.id, "message_id": assistant_message.id, "delta": assistant_message.content},
-            )
+            if not streamed_output_text and assistant_message.content:
+                yield self._event(
+                    "message.delta",
+                    {
+                        "run_id": run.id,
+                        "message_id": assistant_message.id,
+                        "delta": assistant_message.content,
+                        "snapshot": assistant_message.content,
+                    },
+                )
             yield self._event(
                 "run.completed",
                 {
@@ -372,14 +564,18 @@ class AgentRuntime:
                 output_payload={"error": error_message},
                 metadata_json={"error_type": exc.__class__.__name__},
             )
-            assistant_message = Message(
-                thread_id=thread.id,
-                role="assistant",
-                content=f"Runtime error: {error_message}",
-                metadata_json={"error": True},
-            )
-            db.add(assistant_message)
-            db.flush()
+            if assistant_message is None:
+                assistant_message = Message(
+                    thread_id=thread.id,
+                    role="assistant",
+                    content=f"Runtime error: {error_message}",
+                    metadata_json={"error": True},
+                )
+                db.add(assistant_message)
+                db.flush()
+            else:
+                assistant_message.content = f"Runtime error: {error_message}"
+                assistant_message.metadata_json = {"error": True}
             run.assistant_message_id = assistant_message.id
             telemetry_manager.record_event(
                 db,
