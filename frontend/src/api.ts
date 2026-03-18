@@ -49,6 +49,16 @@ export const api = {
     request<Thread>("/threads", { method: "POST", body: JSON.stringify(body) }),
   deleteThread: (threadId: string) => request<{ ok: boolean }>(`/threads/${threadId}`, { method: "DELETE" }),
   getTelemetry: (runId: string) => request<RunTelemetry>(`/runs/${runId}/telemetry`),
+  downloadOtelExport: async (runId: string) => {
+    const data = await request<Record<string, unknown>>(`/runs/${runId}/otel-export`);
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `otel-export-${runId}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
   resolveApproval: (runId: string, approvalId: string, body: Record<string, unknown>) =>
     request<{ run: { id: string; status: string }; assistant_message?: Thread["messages"][number] }>(
       `/runs/${runId}/approvals/${approvalId}`,

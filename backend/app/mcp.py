@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -63,9 +64,12 @@ async def build_openai_mcp_tool(server: MCPServer) -> tuple[dict[str, Any], dict
     token, token_meta = await fetch_access_token(server)
     headers = dict(server.headers or {})
     headers["Authorization"] = f"Bearer {token}"
+    server_label = re.sub(r"[^A-Za-z0-9_-]", "_", server.name)
+    if server_label and not server_label[0].isalpha():
+        server_label = "s_" + server_label
     tool = {
         "type": "mcp",
-        "server_label": server.name,
+        "server_label": server_label,
         "server_url": server.server_url,
         "require_approval": "always" if server.approval_mode == "prompt" else "never",
         "headers": headers,
@@ -146,7 +150,6 @@ def serialize_mcp_server(server: MCPServer) -> dict[str, Any]:
     return {
         "id": server.id,
         "name": server.name,
-        "label": server.label,
         "server_url": server.server_url,
         "token_url": server.token_url,
         "scope": server.scope,

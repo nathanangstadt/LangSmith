@@ -1,17 +1,16 @@
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
-from langsmith import traceable
-from langsmith.wrappers import wrap_openai
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.mcp import build_openai_mcp_tool
-from app.models import AgentProfile, AgentRun, ApprovalDecision, MCPServer, Message, RunStep, Thread
-from app.telemetry import CanonicalSpan, telemetry_manager
+from app.models import AgentProfile, AgentRun, ApprovalDecision, MCPServer, Message, Thread
+from app.telemetry import ActiveSpan, telemetry_manager
 
 
 settings = get_settings()
@@ -24,7 +23,7 @@ class RuntimeErrorResponse(Exception):
 class AgentRuntime:
     def __init__(self) -> None:
         client = OpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
-        self.client = wrap_openai(client) if client else None
+        self.client = client
 
     async def request_approvals_if_needed(
         self,
@@ -66,6 +65,8 @@ class AgentRuntime:
 
     def _prompt(self, profile: AgentProfile) -> str:
         parts = []
+        now = datetime.now(timezone.utc)
+        parts.append(f"System time: {now.strftime('%Y-%m-%dT%H:%M:%S.')}{now.microsecond // 1000:03d}Z")
         if profile.role:
             parts.append(f"Role:\n{profile.role}")
         if profile.guidelines:
@@ -133,6 +134,11 @@ class AgentRuntime:
                 "content_index": getattr(event, "content_index", None),
                 "text": getattr(event, "text", ""),
             }
+        if event_type == "response.completed":
+            return {
+                **base_payload,
+                "response": AgentRuntime._safe_model_dump(getattr(event, "response", {})),
+            }
         return None
 
     @staticmethod
@@ -173,7 +179,6 @@ class AgentRuntime:
     def _supports_temperature(model_name: str) -> bool:
         return not (model_name.startswith("gpt-5") or model_name.startswith("o"))
 
-    @traceable(run_type="chain", name="agent_playground.react_run")
     async def _call_openai_streaming(
         self,
         *,
@@ -206,11 +211,8 @@ class AgentRuntime:
                         payload = self._serialize_stream_event(event)
                         if payload is not None:
                             loop.call_soon_threadsafe(queue.put_nowait, payload)
-                    final_response = stream.get_final_response()
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait,
-                        {"type": "response.completed", "response": self._safe_model_dump(final_response)},
-                    )
+                        if getattr(event, "type", "") == "response.completed":
+                            break  # all data captured; don't wait for response.done
             except Exception as exc:
                 loop.call_soon_threadsafe(
                     queue.put_nowait,
@@ -232,10 +234,15 @@ class AgentRuntime:
                 if event_type == "response.completed":
                     response = stream_event.get("response", {})
                     final_payload = response if isinstance(response, dict) else {}
-                    continue
+                    break  # we have everything we need; don't wait for __done__
                 await on_event(stream_event)
         finally:
-            await task
+            if task.done():
+                await task  # propagate any exception from the producer
+            else:
+                # Stream context-manager cleanup is still running in the background thread.
+                # Don't block waiting for it — let it finish on its own.
+                task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
         if final_payload is None:
             raise RuntimeErrorResponse("OpenAI returned no final response.")
         return final_payload
@@ -243,9 +250,7 @@ class AgentRuntime:
     async def _call_openai_with_mcp_fallback(
         self,
         *,
-        db: Session,
-        run: AgentRun,
-        model_span: CanonicalSpan,
+        model_span: ActiveSpan,
         model_name: str,
         instructions: str,
         temperature: float,
@@ -266,14 +271,12 @@ class AgentRuntime:
         except Exception as exc:
             message = str(exc)
             if tools and ("Error retrieving tool list from MCP server" in message or "external_connector_error" in message):
-                telemetry_manager.record_event(
-                    db,
-                    run_id=run.id,
-                    trace_id=run.trace_id,
-                    span_id=model_span.span_id,
-                    event_type="mcp.fallback",
-                    payload={"reason": message, "skipped_servers": [tool.get("server_label") for tool in tools]},
-                )
+                otel_span = getattr(model_span, "_otel_span", None)
+                if otel_span:
+                    otel_span.add_event("mcp.fallback", attributes={
+                        "reason": message[:512],
+                        "skipped_servers": json.dumps([tool.get("server_label") for tool in tools]),
+                    })
                 response = await self._call_openai_streaming(
                     model_name=model_name,
                     instructions=instructions,
@@ -294,49 +297,35 @@ class AgentRuntime:
         user_message: Message,
         auto_servers: list[MCPServer],
         prompt_servers: list[MCPServer],
-        ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[str, None]:
         run = db.merge(run)
         root_span = telemetry_manager.start_span(
             run,
             name="react.run",
             kind="run",
             attributes={"thread_id": thread.id, "agent_profile_id": profile.id},
-            input_payload={"message_id": user_message.id, "content": user_message.content},
         )
-        model_span: CanonicalSpan | None = None
+        model_span: ActiveSpan | None = None
         model_span_ended = False
         assistant_message: Message | None = None
         try:
             approvals = await self.request_approvals_if_needed(db, run, prompt_servers)
             if self.approvals_denied(approvals):
                 run.status = "failed"
-                step = telemetry_manager.end_span(
-                    db,
-                    run,
-                    root_span,
-                    step_index=0,
-                    status="failed",
-                    output_payload={"error": "An MCP approval was denied."},
-                )
+                root_span._otel_span.add_event("run.failed", attributes={"error": "An MCP approval was denied."})  # type: ignore[attr-defined]
+                telemetry_manager.end_span(root_span, status="failed")
                 db.commit()
-                yield self._event("run.failed", {"run_id": run.id, "step_id": step.id, "error": "Approval denied"})
+                yield self._event("run.failed", {"run_id": run.id, "span_id": root_span.span_id, "error": "Approval denied"})
                 return
+
             if approvals and not self.approvals_ready(approvals):
                 run.status = "waiting_for_approval"
                 for approval in approvals:
-                    telemetry_manager.record_event(
-                        db,
-                        run_id=run.id,
-                        trace_id=run.trace_id,
-                        span_id=root_span.span_id,
-                        event_type="approval.requested",
-                        payload={
-                            "approval_id": approval.id,
-                            "server_name": approval.metadata_json.get("server_name"),
-                            "server_url": approval.metadata_json.get("server_url"),
-                            "allowed_tools": approval.metadata_json.get("allowed_tools"),
-                        },
-                    )
+                    root_span._otel_span.add_event("approval.requested", attributes={  # type: ignore[attr-defined]
+                        "approval_id": approval.id,
+                        "server_name": str(approval.metadata_json.get("server_name", "")),
+                        "server_url": str(approval.metadata_json.get("server_url", "")),
+                    })
                     yield self._event(
                         "run.approval.requested",
                         {
@@ -346,53 +335,52 @@ class AgentRuntime:
                             "metadata": approval.metadata_json,
                         },
                     )
-                telemetry_manager.end_span(
-                    db,
-                    run,
-                    root_span,
-                    step_index=0,
-                    status="waiting_for_approval",
-                    output_payload={"status": "waiting_for_approval"},
-                )
+                telemetry_manager.end_span(root_span, status="waiting_for_approval")
                 db.commit()
                 return
 
             messages = list(db.query(Message).filter(Message.thread_id == thread.id).order_by(Message.created_at))
+
             prepare_span = telemetry_manager.start_span(
                 run,
                 name="prepare.prompt",
                 kind="prepare",
-                parent_span_id=root_span.span_id,
+                parent_otel_span=root_span._otel_span,  # type: ignore[attr-defined]
                 attributes={"message_count": len(messages)},
             )
-            telemetry_manager.end_span(
-                db,
-                run,
-                prepare_span,
-                step_index=1,
-                output_payload={"instructions": self._prompt(profile)},
-            )
+            telemetry_manager.end_span(prepare_span)
             yield self._event("run.step.completed", {"run_id": run.id, "kind": "prepare"})
 
             tools = []
-            token_meta: list[dict[str, Any]] = []
             for server in [*auto_servers, *prompt_servers]:
-                tool, meta = await build_openai_mcp_tool(server)
+                tool, _ = await build_openai_mcp_tool(server)
                 tools.append(tool)
-                token_meta.append({"server_name": server.name, **meta})
+
+            instructions = self._prompt(profile)
+            input_items = self._conversation_input(messages)
 
             model_span = telemetry_manager.start_span(
                 run,
                 name="model.call",
                 kind="model",
-                parent_span_id=root_span.span_id,
-                attributes={"model": profile.model_name, "tool_count": len(tools)},
-                input_payload={
-                    "instructions": self._prompt(profile),
-                    "input_items": self._conversation_input(messages),
-                    "tools": [tool["server_label"] for tool in tools],
+                parent_otel_span=root_span._otel_span,  # type: ignore[attr-defined]
+                attributes={
+                    "gen_ai.request.model": profile.model_name,
+                    "gen_ai.request.temperature": profile.temperature,
+                    "tool_count": len(tools),
                 },
             )
+            model_otel = model_span._otel_span  # type: ignore[attr-defined]
+
+            # Record the full conversation as OTEL span events (gen_ai semantic conventions).
+            model_otel.add_event("gen_ai.system.message", attributes={"gen_ai.prompt": instructions[:8192]})
+            for item in input_items:
+                role = item.get("role", "user")
+                model_otel.add_event(
+                    f"gen_ai.{role}.message",
+                    attributes={"gen_ai.prompt": json.dumps(item)[:8192]},
+                )
+
             assistant_message = Message(
                 thread_id=thread.id,
                 role="assistant",
@@ -408,36 +396,47 @@ class AgentRuntime:
                 {
                     "run_id": run.id,
                     "kind": "model",
-                    "instructions": self._prompt(profile),
-                    "input_items": self._conversation_input(messages),
+                    "instructions": instructions,
+                    "input_items": input_items,
                 },
             )
+
             streamed_output_text = ""
             queued_events: asyncio.Queue[str] = asyncio.Queue()
 
             async def on_stream_event(stream_event: dict[str, Any]) -> None:
                 nonlocal streamed_output_text
                 event_type = str(stream_event.get("type", ""))
-                telemetry_manager.record_event(
-                    db,
-                    run_id=run.id,
-                    trace_id=run.trace_id,
-                    span_id=model_span.span_id,
-                    event_type=event_type,
-                    payload=stream_event,
-                )
-                if event_type in {"response.output_item.added", "response.output_item.done"}:
+
+                # Record completed output items as OTEL span events.
+                if event_type == "response.output_item.done":
+                    item = stream_event.get("item") or {}
+                    item_attrs: dict[str, str] = {
+                        "item.type": str(item.get("type", "")),
+                        "item.id": str(item.get("id", "")),
+                        "content": json.dumps(item)[:65536],
+                    }
+                    # Store text separately so the frontend can recover it even if the
+                    # full JSON is truncated (long invoice / report responses).
+                    if item.get("type") == "message":
+                        content_list = item.get("content", [])
+                        if isinstance(content_list, list):
+                            text = " ".join(
+                                str(c.get("text", ""))
+                                for c in content_list
+                                if isinstance(c, dict) and c.get("type") == "output_text"
+                            )
+                            if text:
+                                item_attrs["text"] = text[:65536]
+                    model_otel.add_event("gen_ai.output_item.done", attributes=item_attrs)
                     await queued_events.put(
                         self._event(
                             "run.detail.item",
-                            {
-                                "run_id": run.id,
-                                "kind": "model",
-                                **stream_event,
-                            },
+                            {"run_id": run.id, "kind": "model", **stream_event},
                         )
                     )
                     return
+
                 if event_type == "response.output_text.delta":
                     snapshot = str(stream_event.get("snapshot") or "")
                     delta = str(stream_event.get("delta") or "")
@@ -465,6 +464,7 @@ class AgentRuntime:
                         )
                     )
                     return
+
                 if event_type == "response.output_text.done":
                     text = str(stream_event.get("text") or "")
                     if text:
@@ -484,13 +484,11 @@ class AgentRuntime:
 
             model_call = asyncio.create_task(
                 self._call_openai_with_mcp_fallback(
-                    db=db,
-                    run=run,
                     model_span=model_span,
                     model_name=profile.model_name,
-                    instructions=self._prompt(profile),
+                    instructions=instructions,
                     temperature=profile.temperature,
-                    input_items=self._conversation_input(messages),
+                    input_items=input_items,
                     tools=tools,
                     on_event=on_stream_event,
                 )
@@ -500,33 +498,29 @@ class AgentRuntime:
                     await asyncio.sleep(0.02)
                     continue
                 yield await queued_events.get()
+
             response, used_mcp_fallback = await model_call
             output_text = self._response_text_from_payload(response) or streamed_output_text
             usage_payload = self._response_usage_payload(response)
             response_id = response.get("id")
-            response_output_items = response.get("output", [])
-            if not isinstance(response_output_items, list):
-                response_output_items = []
-            model_span_ended = True
-            model_step = telemetry_manager.end_span(
-                db,
-                run,
-                model_span,
-                step_index=2,
-                output_payload={
-                    "response_id": response_id,
-                    "output_text": output_text,
-                    "response_items": response_output_items,
-                    "token_meta": token_meta,
+
+            # Set token usage as OTEL attributes and record the completion event.
+            if usage_payload.get("input_tokens") is not None:
+                model_otel.set_attribute("gen_ai.usage.input_tokens", int(usage_payload["input_tokens"]))
+            if usage_payload.get("output_tokens") is not None:
+                model_otel.set_attribute("gen_ai.usage.output_tokens", int(usage_payload["output_tokens"]))
+            if usage_payload.get("total_tokens") is not None:
+                model_otel.set_attribute("gen_ai.usage.total_tokens", int(usage_payload["total_tokens"]))
+            if output_text:
+                model_otel.add_event("gen_ai.choice", attributes={
+                    "gen_ai.completion": output_text[:65536],
+                    "finish_reason": "stop",
                     "used_mcp_fallback": used_mcp_fallback,
-                },
-                token_usage=usage_payload,
-                metadata_json={"response_id": response_id, "used_mcp_fallback": used_mcp_fallback},
-            )
-            yield self._event(
-                "run.step.completed",
-                {"run_id": run.id, "kind": "model", "step_id": model_step.id, "usage": usage_payload},
-            )
+                })
+
+            model_span_ended = True
+            telemetry_manager.end_span(model_span)
+            yield self._event("run.step.completed", {"run_id": run.id, "kind": "model", "span_id": model_span.span_id, "usage": usage_payload})
 
             assistant_message.content = output_text or "(empty response)"
             assistant_message.metadata_json = {"response_id": response_id}
@@ -536,23 +530,12 @@ class AgentRuntime:
                 run,
                 name="final.answer",
                 kind="final",
-                parent_span_id=root_span.span_id,
+                parent_otel_span=root_span._otel_span,  # type: ignore[attr-defined]
             )
-            final_step = telemetry_manager.end_span(
-                db,
-                run,
-                final_span,
-                step_index=3,
-                output_payload={"assistant_message_id": assistant_message.id, "content": assistant_message.content},
-            )
-            telemetry_manager.end_span(
-                db,
-                run,
-                root_span,
-                step_index=4,
-                output_payload={"status": "completed", "assistant_message_id": assistant_message.id},
-            )
+            telemetry_manager.end_span(final_span)
+            telemetry_manager.end_span(root_span)
             db.commit()
+
             if not streamed_output_text and assistant_message.content:
                 yield self._event(
                     "message.delta",
@@ -567,6 +550,7 @@ class AgentRuntime:
                 "run.completed",
                 {
                     "run_id": run.id,
+                    "span_id": final_span.span_id,
                     "assistant_message": {
                         "id": assistant_message.id,
                         "thread_id": assistant_message.thread_id,
@@ -574,22 +558,19 @@ class AgentRuntime:
                         "content": assistant_message.content,
                         "metadata_json": assistant_message.metadata_json,
                     },
-                    "final_step_id": final_step.id,
                 },
             )
         except Exception as exc:
             error_message = str(exc)
             run.status = "failed"
             failed_span = (model_span if model_span and not model_span_ended else None) or root_span
-            step = telemetry_manager.end_span(
-                db,
-                run,
-                failed_span,
-                step_index=99,
-                status="failed",
-                output_payload={"error": error_message},
-                metadata_json={"error_type": exc.__class__.__name__},
-            )
+            failed_otel = getattr(failed_span, "_otel_span", None)
+            if failed_otel:
+                failed_otel.add_event("run.failed", attributes={"error": error_message, "error_type": exc.__class__.__name__})
+            telemetry_manager.end_span(failed_span, status="failed")
+            if failed_span is not root_span:
+                telemetry_manager.close_otel_span(root_span, status="failed")
+
             if assistant_message is None:
                 assistant_message = Message(
                     thread_id=thread.id,
@@ -603,20 +584,12 @@ class AgentRuntime:
                 assistant_message.content = f"Runtime error: {error_message}"
                 assistant_message.metadata_json = {"error": True}
             run.assistant_message_id = assistant_message.id
-            telemetry_manager.record_event(
-                db,
-                run_id=run.id,
-                trace_id=run.trace_id,
-                span_id=root_span.span_id,
-                event_type="run.failed",
-                payload={"error": error_message},
-            )
             db.commit()
             yield self._event(
                 "run.failed",
                 {
                     "run_id": run.id,
-                    "step_id": step.id,
+                    "span_id": failed_span.span_id,
                     "error": error_message,
                     "assistant_message": {
                         "id": assistant_message.id,

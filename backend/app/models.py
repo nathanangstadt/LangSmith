@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
@@ -52,12 +52,32 @@ class AgentProfile(Base, TimestampMixin):
     llm_connection: Mapped[LLMConnection | None] = relationship()
 
 
+class OtelSpan(Base):
+    __tablename__ = "otel_spans"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    trace_id: Mapped[str] = mapped_column(String(64))
+    span_id: Mapped[str] = mapped_column(String(32), unique=True)
+    parent_span_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    name: Mapped[str] = mapped_column(String(120))
+    kind: Mapped[str] = mapped_column(String(16))
+    start_time_unix_nano: Mapped[int] = mapped_column(BigInteger)
+    end_time_unix_nano: Mapped[int] = mapped_column(BigInteger)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status_code: Mapped[str] = mapped_column(String(16))
+    status_message: Mapped[str] = mapped_column(Text, default="")
+    attributes: Mapped[dict] = mapped_column(json_type(), default=dict)
+    events: Mapped[list] = mapped_column(json_type(), default=list)
+    resource_attributes: Mapped[dict] = mapped_column(json_type(), default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class MCPServer(Base, TimestampMixin):
     __tablename__ = "mcp_servers"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(String(120), unique=True)
-    label: Mapped[str] = mapped_column(String(120))
     server_url: Mapped[str] = mapped_column(Text)
     token_url: Mapped[str] = mapped_column(Text)
     grant_type: Mapped[str] = mapped_column(String(64), default="client_credentials")
@@ -105,37 +125,6 @@ class AgentRun(Base, TimestampMixin):
     otel_trace_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     metadata_json: Mapped[dict] = mapped_column(json_type(), default=dict)
 
-
-class RunStep(Base, TimestampMixin):
-    __tablename__ = "run_steps"
-
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"))
-    step_index: Mapped[int] = mapped_column(Integer)
-    kind: Mapped[str] = mapped_column(String(32))
-    name: Mapped[str] = mapped_column(String(120))
-    status: Mapped[str] = mapped_column(String(32), default="completed")
-    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    token_usage: Mapped[dict] = mapped_column(json_type(), default=dict)
-    input_payload: Mapped[dict] = mapped_column(json_type(), default=dict)
-    output_payload: Mapped[dict] = mapped_column(json_type(), default=dict)
-    metadata_json: Mapped[dict] = mapped_column(json_type(), default=dict)
-    span_id: Mapped[str] = mapped_column(String(64))
-    parent_span_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    langsmith_run_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    otel_span_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-
-
-class TelemetryEvent(Base, TimestampMixin):
-    __tablename__ = "telemetry_events"
-
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"))
-    step_id: Mapped[str | None] = mapped_column(ForeignKey("run_steps.id"), nullable=True)
-    event_type: Mapped[str] = mapped_column(String(64))
-    trace_id: Mapped[str] = mapped_column(String(64))
-    span_id: Mapped[str] = mapped_column(String(64))
-    payload: Mapped[dict] = mapped_column(json_type(), default=dict)
 
 
 class ApprovalDecision(Base, TimestampMixin):

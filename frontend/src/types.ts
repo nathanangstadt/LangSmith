@@ -23,7 +23,6 @@ export type AgentProfile = {
 export type MCPServer = {
   id: string;
   name: string;
-  label: string;
   server_url: string;
   token_url: string;
   grant_type: string;
@@ -58,6 +57,29 @@ export type Thread = {
   messages: Message[];
 };
 
+export type OtelSpan = {
+  id: string;
+  run_id: string | null;
+  trace_id: string;
+  span_id: string;
+  parent_span_id: string | null;
+  name: string;
+  kind: string;
+  start_time_unix_nano: number;
+  end_time_unix_nano: number;
+  duration_ms: number | null;
+  status_code: string;
+  status_message: string;
+  attributes: Record<string, unknown>;
+  events: Array<{
+    name: string;
+    time_unix_nano: number;
+    attributes: Record<string, unknown>;
+  }>;
+  resource_attributes: Record<string, unknown>;
+  created_at: string;
+};
+
 export type RunTelemetry = {
   run: {
     id: string;
@@ -65,40 +87,15 @@ export type RunTelemetry = {
     agent_profile_id?: string;
     status: string;
     trace_id: string;
-    langsmith_run_id?: string | null;
-    otel_trace_id?: string | null;
+    metadata_json?: Record<string, unknown>;
   };
-  steps: Array<{
-    id: string;
-    step_index: number;
-    kind: string;
-    name: string;
-    status: string;
-    latency_ms?: number | null;
-    token_usage: Record<string, unknown>;
-    input_payload: Record<string, unknown>;
-    output_payload: Record<string, unknown>;
-    metadata_json: Record<string, unknown>;
-    span_id: string;
-    parent_span_id?: string | null;
-    langsmith_run_id?: string | null;
-    otel_span_id?: string | null;
-    created_at: string;
-  }>;
+  spans: OtelSpan[];
   approvals: Array<{
     id: string;
     mcp_server_id: string;
     status: string;
     rationale?: string | null;
     metadata_json: Record<string, unknown>;
-  }>;
-  telemetry: Array<{
-    id: string;
-    event_type: string;
-    trace_id: string;
-    span_id: string;
-    payload: Record<string, unknown>;
-    created_at: string;
   }>;
 };
 

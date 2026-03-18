@@ -59,7 +59,6 @@ def export_agent_md(profile: dict[str, Any], mcp_servers: list[dict[str, Any]]) 
         "mcp_servers": [
             {
                 "key": server["name"],
-                "label": server["label"],
                 "server_url": server["server_url"],
                 "token_url": server["token_url"],
                 "auth": {

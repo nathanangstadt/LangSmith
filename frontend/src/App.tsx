@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 
 import { api } from "./api";
-import type { AgentProfile, MCPServer, PendingApproval, RunTelemetry, Thread } from "./types";
+import type { AgentProfile, MCPServer, OtelSpan, PendingApproval, RunTelemetry, Thread } from "./types";
+
+type SpanNode = OtelSpan & { children: SpanNode[] };
 
 const defaultProfileForm = {
   name: "oracle-investigator",
@@ -25,7 +27,6 @@ const defaultProfileForm = {
 
 const defaultMcpForm = {
   name: "oracle_docs",
-  label: "Oracle Docs MCP",
   server_url: "",
   token_url: "",
   grant_type: "client_credentials",
@@ -80,6 +81,7 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState("");
   const [serverTestState, setServerTestState] = useState<ServerTestState>({ status: "idle", message: "", tools: [] });
   const [liveDetailedActivity, setLiveDetailedActivity] = useState<DetailedActivityItem[]>([]);
+  const [traceModalOpen, setTraceModalOpen] = useState(false);
   const [backendConfig, setBackendConfig] = useState<{ langsmith_enabled: boolean; langsmith_project: string; otel_enabled: boolean; otel_endpoint: string; openai_configured: boolean } | null>(null);
 
   useEffect(() => {
@@ -94,7 +96,15 @@ export default function App() {
       api.listServers(),
     ]);
     setProfiles(profileData);
-    setThreads(threadData);
+    // Preserve in-memory messages: listThreads returns threads with messages=[].
+    // Merging keeps messages loaded during this session visible after refresh.
+    setThreads((current) => {
+      const messageMap = new Map(current.map((t) => [t.id, t.messages]));
+      return threadData.map((thread) => ({
+        ...thread,
+        messages: messageMap.get(thread.id) ?? [],
+      }));
+    });
     setServers(serverData);
     if (!selectedProfileId && profileData[0]) setSelectedProfileId(profileData[0].id);
     if (!selectedThreadId && threadData[0]) setSelectedThreadId(threadData[0].id);
@@ -140,11 +150,6 @@ export default function App() {
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId);
   const selectedServer = servers.find((server) => server.id === selectedServerId);
   const temperatureDisabled = profileForm.model_name.startsWith("gpt-5") || profileForm.model_name.startsWith("o");
-  const formatStepName = (value: string) =>
-    value
-      .split(".")
-      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-      .join(" / ");
   const detailedMessagesEnabled = Boolean(selectedProfile?.ui_json?.detailed_messages_enabled);
 
   useEffect(() => {
@@ -202,6 +207,8 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedThreadId || waitingThreadId === selectedThreadId) return;
+    // Load full thread messages when switching threads.
+    api.getThread(selectedThreadId).then(upsertThread).catch(() => {});
     api.listRuns(selectedThreadId).then((runs) => {
       if (runs.length > 0) {
         setActiveRunId(runs[0].id);
@@ -416,6 +423,99 @@ export default function App() {
     return [];
   };
 
+  const buildSpanTree = (spans: OtelSpan[]): SpanNode | null => {
+    const nodes = new Map(spans.map((s) => ({ ...s, children: [] as SpanNode[] })).map((n) => [n.span_id, n]));
+    let root: SpanNode | null = null;
+    for (const node of nodes.values()) {
+      if (node.parent_span_id && nodes.has(node.parent_span_id)) {
+        nodes.get(node.parent_span_id)!.children.push(node);
+      } else {
+        root = node;
+      }
+    }
+    return root;
+  };
+
+  const spanVisual = (name: string, attrs: Record<string, unknown>, durationMs: number | null) => {
+    const dur = durationMs != null ? (durationMs >= 1000 ? `~${(durationMs / 1000).toFixed(1)}s` : `~${durationMs}ms`) : "";
+    if (name === "react.run") return { bg: "#3b2d7e", subtitle: `Root span · ${dur} total` };
+    if (name === "model.call") return { bg: "#7a4a18", subtitle: `${String(attrs["gen_ai.request.model"] ?? "")} · ${dur}` };
+    if (name === "prepare.prompt") return { bg: "#1a5c4a", subtitle: `${String(attrs["agent.message_count"] ?? "?")} message` };
+    if (name === "final.answer") return { bg: "#1a5c4a", subtitle: "Summary output" };
+    return { bg: "#2a4258", subtitle: name };
+  };
+
+  type TraceEventRow = { key: string; bg: string; title: string; subtitle: string };
+
+  const parseTraceEvents = (span: OtelSpan): TraceEventRow[] => {
+    const rows: TraceEventRow[] = [];
+    let i = 0;
+    while (i < span.events.length) {
+      const ev = span.events[i];
+      const attrs = ev.attributes;
+      if (ev.name === "gen_ai.system.message") {
+        const text = String(attrs["gen_ai.prompt"] ?? "");
+        rows.push({ key: `${i}`, bg: "#3d4852", title: "System prompt", subtitle: text.slice(0, 90) + (text.length > 90 ? "…" : "") });
+        i++; continue;
+      }
+      if (ev.name === "gen_ai.user.message" || ev.name === "gen_ai.assistant.message") {
+        const role = ev.name === "gen_ai.user.message" ? "User" : "Assistant context";
+        const raw = String(attrs["gen_ai.prompt"] ?? "");
+        let preview = raw;
+        try {
+          const p = JSON.parse(raw) as Record<string, unknown>;
+          const c = p.content;
+          if (Array.isArray(c)) preview = c.map((x: unknown) => (x && typeof x === "object" && "text" in x ? String((x as { text: string }).text) : "")).filter(Boolean).join(" ");
+        } catch { /* use raw */ }
+        rows.push({ key: `${i}`, bg: "#3d4852", title: `${role} message`, subtitle: `"${preview.slice(0, 90)}${preview.length > 90 ? "…" : ""}"` });
+        i++; continue;
+      }
+      if (ev.name === "gen_ai.output_item.done") {
+        let item: Record<string, unknown> = {};
+        try { item = JSON.parse(String(attrs["content"] ?? "{}")); } catch { /* */ }
+        const type = String(item.type ?? "");
+        if (type === "mcp_call") {
+          const toolName = String(item.name ?? "tool");
+          let count = 1;
+          const subtitles: string[] = [];
+          const fmt = (it: Record<string, unknown>) => {
+            const args = typeof it.arguments === "string" ? it.arguments : JSON.stringify(it.arguments ?? "");
+            const out = String(it.output ?? "").trim().slice(0, 50);
+            return `${args.slice(0, 30)}${out ? ` → ${out}` : ""}`;
+          };
+          subtitles.push(fmt(item));
+          while (i + count < span.events.length) {
+            const nev = span.events[i + count];
+            if (nev.name !== "gen_ai.output_item.done") break;
+            let nit: Record<string, unknown> = {};
+            try { nit = JSON.parse(String(nev.attributes["content"] ?? "{}")); } catch { /* */ }
+            if (String(nit.type ?? "") !== "mcp_call" || String(nit.name ?? "") !== toolName) break;
+            subtitles.push(fmt(nit));
+            count++;
+          }
+          const bg = toolName.startsWith("LIST") ? "#1e3a5f" : toolName.startsWith("CLASSIFY") ? "#5c2a1a" : "#1e3a5f";
+          rows.push({ key: `${i}`, bg, title: count > 1 ? `Tool call: ${toolName} × ${count}` : `Tool call: ${toolName}`, subtitle: subtitles.slice(0, 3).join(" · ") });
+          i += count; continue;
+        }
+        if (type === "message") {
+          const content = Array.isArray(item.content) ? item.content : [];
+          const text = content.map((c: unknown) => (c && typeof c === "object" && "text" in c ? String((c as { text: string }).text) : "")).filter(Boolean).join(" ");
+          rows.push({ key: `${i}`, bg: "#3d4852", title: "Model output", subtitle: text.slice(0, 120) + (text.length > 120 ? "…" : "") });
+          i++; continue;
+        }
+        i++; continue;
+      }
+      if (ev.name === "gen_ai.choice") {
+        const completion = String(attrs["gen_ai.completion"] ?? "");
+        const reason = String(attrs["finish_reason"] ?? "stop");
+        rows.push({ key: `${i}`, bg: "#1a5c2a", title: `gen_ai.choice (finish_reason: ${reason})`, subtitle: completion.slice(0, 100) + (completion.length > 100 ? "…" : "") });
+        i++; continue;
+      }
+      i++;
+    }
+    return rows;
+  };
+
   const upsertLiveDetailedItems = (items: DetailedActivityItem[]) => {
     setLiveDetailedActivity((current) => {
       const next = [...current];
@@ -582,7 +682,6 @@ export default function App() {
 
   const serverToForm = (server: MCPServer): MpcFormState => ({
     name: server.name,
-    label: server.label,
     server_url: server.server_url,
     token_url: server.token_url,
     grant_type: server.grant_type,
@@ -635,9 +734,9 @@ export default function App() {
       });
       closeMenu();
       setServerTestState({ status: "idle", message: "", tools: [] });
-      setStatusLine(`Selected ${server.label}`);
+      setStatusLine(`Selected ${server.name}`);
     } catch (error) {
-      handleError(error, `Unable to load ${server.label}`);
+      handleError(error, `Unable to load ${server.name}`);
     }
   };
 
@@ -657,7 +756,7 @@ export default function App() {
       const payload = serializeDraftServer(mcpForm);
       const saved = selectedServerId
         ? await api.updateServer(selectedServerId, {
-            label: payload.label,
+            name: payload.name,
             server_url: payload.server_url,
             token_url: payload.token_url,
             grant_type: payload.grant_type,
@@ -677,7 +776,7 @@ export default function App() {
         client_id: detail.client_id,
         client_secret: detail.client_secret,
       });
-      setStatusLine(`${selectedServerId ? "Updated" : "Saved"} MCP server ${saved.label}`);
+      setStatusLine(`${selectedServerId ? "Updated" : "Saved"} MCP server ${saved.name}`);
       setServerTestState({ status: "idle", message: "", tools: [] });
       closeMenu();
       await refreshAll();
@@ -709,7 +808,7 @@ export default function App() {
     setErrorMessage("");
     try {
       const result = await api.testDraftServer(serializeDraftServer(mcpForm));
-      const label = selectedServerId ? mcpForm.label || mcpForm.name : `Draft ${mcpForm.label || mcpForm.name}`;
+      const label = selectedServerId ? mcpForm.name : `Draft ${mcpForm.name}`;
       const message = buildServerTestMessage(result, label);
       const tools = Array.isArray(result.discovered_tools)
         ? result.discovered_tools.map((tool) => String(tool))
@@ -859,35 +958,105 @@ export default function App() {
 
   const persistedDetailedActivity: DetailedActivityItem[] =
     detailedMessagesEnabled && telemetry?.run.thread_id === selectedThreadId
-      ? telemetry.steps.flatMap<DetailedActivityItem>((step) => {
-          if (step.kind !== "model") return [];
-          const instructions = typeof step.input_payload.instructions === "string" ? step.input_payload.instructions : "";
-          const inputItems = Array.isArray(step.input_payload.input_items)
-            ? (step.input_payload.input_items as Record<string, unknown>[])
-            : [];
-          const responseItems = Array.isArray(step.output_payload.response_items)
-            ? (step.output_payload.response_items as Record<string, unknown>[])
-            : [];
-          return [
-            ...buildInputDetailedItems(instructions, inputItems, step.step_index * 1000),
-            ...responseItems.flatMap<DetailedActivityItem>((item, index) => {
-              return buildOutputDetailedItems(item, `${step.id}-${index}`, step.step_index * 1000 + 100 + index);
-            }),
-          ];
-        })
+      ? telemetry.spans
+          .slice()
+          .sort((a, b) => a.start_time_unix_nano - b.start_time_unix_nano)
+          .flatMap<DetailedActivityItem>((span, spanIndex) => {
+            const items: DetailedActivityItem[] = [];
+            const orderBase = spanIndex * 1000;
+            span.events.forEach((event, eventIndex) => {
+              const attrs = event.attributes;
+              if (event.name === "gen_ai.system.message") {
+                const prompt = String(attrs["gen_ai.prompt"] ?? "");
+                if (prompt.trim()) {
+                  items.push({ key: `${span.span_id}-system`, role: "system", label: "System", body: prompt, raw: attrs, order: orderBase + eventIndex });
+                }
+              } else if (event.name === "gen_ai.user.message" || event.name === "gen_ai.assistant.message") {
+                const role = event.name === "gen_ai.user.message" ? "user" : "assistant_context";
+                const label = role === "user" ? "User" : "Assistant Context";
+                const prompt = String(attrs["gen_ai.prompt"] ?? "");
+                try {
+                  const parsed = JSON.parse(prompt) as Record<string, unknown>;
+                  const body = contentText(parsed.content, "text");
+                  if (body) items.push({ key: `${span.span_id}-${event.name}-${eventIndex}`, role: role as DetailedActivityItem["role"], label, body, raw: parsed, order: orderBase + eventIndex });
+                } catch {
+                  if (prompt.trim()) items.push({ key: `${span.span_id}-${event.name}-${eventIndex}`, role: role as DetailedActivityItem["role"], label, body: prompt, raw: attrs, order: orderBase + eventIndex });
+                }
+              } else if (event.name === "gen_ai.output_item.done") {
+                try {
+                  const item = JSON.parse(String(attrs["content"] ?? "{}")) as Record<string, unknown>;
+                  items.push(...buildOutputDetailedItems(item, `${span.span_id}-output-${eventIndex}`, orderBase + eventIndex));
+                } catch {
+                  // JSON truncated — recover text from the `text` attribute (stored separately by new backend).
+                  const text = String(attrs["text"] ?? "");
+                  const itemType = String(attrs["item.type"] ?? "");
+                  const itemId = String(attrs["item.id"] ?? `${span.span_id}-output-${eventIndex}`);
+                  if (itemType === "message" && text) {
+                    items.push({
+                      key: itemId,
+                      role: "assistant",
+                      label: "Assistant",
+                      body: text,
+                      raw: attrs,
+                      order: orderBase + eventIndex,
+                    });
+                  }
+                }
+              } else if (event.name === "gen_ai.choice") {
+                // gen_ai.choice carries the full completion text at end-of-loop (finish_reason: stop),
+                // regardless of when in the stream the text was emitted. Use it to fill in the assistant
+                // message if no message item was successfully parsed from gen_ai.output_item.done.
+                const completion = String(attrs["gen_ai.completion"] ?? "");
+                if (completion && !items.some((i) => i.role === "assistant")) {
+                  items.push({
+                    key: `${span.span_id}-choice`,
+                    role: "assistant",
+                    label: "Assistant",
+                    body: completion,
+                    raw: attrs,
+                    order: orderBase + eventIndex,
+                  });
+                }
+              }
+            });
+            return items;
+          })
       : [];
 
   const visibleLiveDetailedActivity =
     selectedThreadId && waitingThreadId === selectedThreadId ? liveDetailedActivity : [];
 
+  // If persisted activity has other items (input, tool calls) but no assistant message,
+  // the OTEL content was likely truncated. Fall back to the finalized message from thread state,
+  // which is always fetched from the DB via api.getThread().
+  const persistedHasItems = persistedDetailedActivity.length > 0;
+  const persistedHasAssistant = persistedDetailedActivity.some((item) => item.role === "assistant");
+  const dbAssistantFallback: DetailedActivityItem[] =
+    detailedMessagesEnabled &&
+    persistedHasItems &&
+    !persistedHasAssistant &&
+    waitingThreadId !== selectedThreadId
+      ? (() => {
+          const msg = selectedThread?.messages
+            .slice()
+            .reverse()
+            .find((m) => m.role === "assistant" && !m.metadata_json?.streaming);
+          if (!msg?.content || msg.content === "(empty response)") return [];
+          return [{
+            key: `db-assistant-${msg.id}`,
+            role: "assistant" as const,
+            label: "Assistant",
+            body: msg.content,
+            raw: { id: msg.id, content: msg.content },
+            order: Number.MAX_SAFE_INTEGER - 50,
+          }];
+        })()
+      : [];
+
   const detailedActivity: DetailedActivityItem[] = detailedMessagesEnabled && selectedThread
-    ? Array.from(new Map([...visibleLiveDetailedActivity, ...persistedDetailedActivity].map((item) => [item.key, item])).values())
+    ? Array.from(new Map([...visibleLiveDetailedActivity, ...persistedDetailedActivity, ...dbAssistantFallback].map((item) => [item.key, item])).values())
         .sort((left, right) => (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER))
     : [];
-
-  const hasStreamingAssistantMessage = Boolean(
-    selectedThread?.messages.some((message) => message.role === "assistant" && Boolean(message.metadata_json?.streaming)),
-  );
 
   return (
     <div className="shell">
@@ -1022,7 +1191,7 @@ export default function App() {
               {servers.map((server) => (
                 <div key={server.id} className={server.id === selectedServerId ? "entity-row selected" : "entity-row"}>
                     <button className="entity-main" onClick={() => void onSelectServer(server)}>
-                    <strong>{server.label}</strong>
+                    <strong>{server.name}</strong>
                     <span>{server.enabled ? "Enabled" : "Disabled"} · {server.approval_mode}</span>
                   </button>
                   <div className="entity-actions">
@@ -1032,7 +1201,7 @@ export default function App() {
                         event.stopPropagation();
                         toggleMenu("servers", server.id);
                       }}
-                      aria-label={`MCP server options for ${server.label}`}
+                      aria-label={`MCP server options for ${server.name}`}
                     >
                       ⋮
                     </button>
@@ -1053,7 +1222,7 @@ export default function App() {
             </div>
 
             <div className="mcp-editor">
-              {isServerEditorOpen && <h3>{selectedServer ? selectedServer.label : "New MCP Server"}</h3>}
+              {isServerEditorOpen && <h3>{selectedServer ? selectedServer.name : "New MCP Server"}</h3>}
               {isServerEditorOpen && (
                 <>
               <p className="helper-text">
@@ -1072,8 +1241,6 @@ export default function App() {
               </div>
               <label>Name</label>
               <input value={mcpForm.name} onChange={(e) => onMcpField("name", e.target.value)} />
-              <label>Label</label>
-              <input value={mcpForm.label} onChange={(e) => onMcpField("label", e.target.value)} />
               <label>Server URL</label>
               <input value={mcpForm.server_url} onChange={(e) => onMcpField("server_url", e.target.value)} />
               <label>Token URL</label>
@@ -1129,8 +1296,14 @@ export default function App() {
             Thread: <strong>{selectedThread?.title ?? "No thread selected"}</strong>
           </p>
           <div className="entity-list thread-list">
-              {threads.map((thread) => (
-                <div key={thread.id} className={thread.id === selectedThreadId ? "entity-row selected" : "entity-row"}>
+              {threads.map((thread) => {
+                const isRunning = waitingThreadId === thread.id;
+                return (
+                <div key={thread.id} className={[
+                  "entity-row",
+                  thread.id === selectedThreadId ? "selected" : "",
+                  isRunning ? "running" : "",
+                ].filter(Boolean).join(" ")}>
                 <button
                   className="entity-main"
                   onClick={() => {
@@ -1139,8 +1312,8 @@ export default function App() {
                     setStatusLine(`Selected ${thread.title}`);
                   }}
                 >
-                  <strong>{thread.title}</strong>
-                  <span>{new Date(thread.updated_at).toLocaleString()}</span>
+                  <strong>{thread.title}{isRunning && <span className="thread-running-dot" aria-label="Running" />}</strong>
+                  <span>{isRunning ? "Running…" : new Date(thread.updated_at).toLocaleString()}</span>
                 </button>
                 <div className="entity-actions">
                   <button
@@ -1160,7 +1333,8 @@ export default function App() {
                   )}
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
 
           <div className="messages">
@@ -1181,11 +1355,11 @@ export default function App() {
                     <pre>{message.content}</pre>
                   </article>
                 ))}
-            {waitingThreadId === selectedThreadId && !hasStreamingAssistantMessage && (
-              <article className="message assistant waiting">
-                <header>assistant</header>
-                <pre>Thinking...</pre>
-              </article>
+            {waitingThreadId === selectedThreadId && (
+              <div className="agent-working-indicator">
+                <span className="thread-running-dot" />
+                <span>Agent working…</span>
+              </div>
             )}
           </div>
 
@@ -1216,9 +1390,9 @@ export default function App() {
         </section>
 
         <section className="telemetry-pane panel">
-          <div className="panel-header">
+          <div className="panel-header telemetry-header">
             <h2>Telemetry</h2>
-            <div className="row-actions">
+            <div className="row-actions telemetry-actions">
               <span className="badge" title="Telemetry is always stored in this app's local Postgres database.">Local</span>
               <span
                 className={backendConfig?.langsmith_enabled ? "badge" : "badge badge--inactive"}
@@ -1232,21 +1406,31 @@ export default function App() {
                   ? `Exporting spans to OTLP endpoint: ${backendConfig.otel_endpoint}`
                   : "OTEL export is off. Set OTEL_EXPORTER_OTLP_ENDPOINT in .env to enable."}
               >OTEL</span>
-              {activeRunId && (
-                <button
-                  className="secondary-button"
-                  title="Reload the current run's telemetry from the backend."
-                  onClick={() => void refreshTelemetry(activeRunId)}
-                >
-                  Refresh
+              {telemetry && telemetry.spans.length > 0 && (
+                <button className="secondary-button" onClick={() => setTraceModalOpen(true)}>
+                  View Trace
                 </button>
+              )}
+              {activeRunId && (
+                <>
+                  <button
+                    className="secondary-button"
+                    title="Download OTLP JSON export for this run."
+                    onClick={() => void api.downloadOtelExport(activeRunId)}
+                  >
+                    Download
+                  </button>
+                  <button
+                    className="secondary-button"
+                    title="Reload the current run's telemetry from the backend."
+                    onClick={() => void refreshTelemetry(activeRunId)}
+                  >
+                    Refresh
+                  </button>
+                </>
               )}
             </div>
           </div>
-          <p className="helper-text telemetry-help">
-            Local stores telemetry in this app. LangSmith and OTEL are external export targets when configured.
-            Refresh reloads the current run from the backend.
-          </p>
           {telemetry ? (
             <>
               <div className="telemetry-summary">
@@ -1256,21 +1440,29 @@ export default function App() {
               </div>
 
               <div className="timeline">
-                {telemetry.steps.map((step) => (
-                  <article key={step.id} className="timeline-card">
+                {telemetry.spans.map((span) => (
+                  <article key={span.id} className="timeline-card">
                     <header>
-                      <strong>{step.step_index}. {formatStepName(step.name)}</strong>
-                      <span className="timeline-kind">{step.kind}</span>
+                      <strong>{span.name}</strong>
+                      <span className="timeline-kind">{span.kind}</span>
                     </header>
-                    <p>Status: {step.status}</p>
-                    <p>Latency: {step.latency_ms ?? "n/a"} ms</p>
-                    <details>
-                      <summary>Formatted</summary>
-                      <pre>{JSON.stringify(step.output_payload, null, 2)}</pre>
-                    </details>
+                    <p>Status: {span.status_code}{span.status_message ? ` — ${span.status_message}` : ""}</p>
+                    <p>Latency: {span.duration_ms ?? "n/a"} ms</p>
+                    {span.events.length > 0 && (
+                      <details>
+                        <summary>Events ({span.events.length})</summary>
+                        <pre>{JSON.stringify(span.events, null, 2)}</pre>
+                      </details>
+                    )}
+                    {Object.keys(span.attributes).length > 0 && (
+                      <details>
+                        <summary>Attributes</summary>
+                        <pre>{JSON.stringify(span.attributes, null, 2)}</pre>
+                      </details>
+                    )}
                     <details>
                       <summary>Raw</summary>
-                      <pre>{JSON.stringify(step, null, 2)}</pre>
+                      <pre>{JSON.stringify(span, null, 2)}</pre>
                     </details>
                   </article>
                 ))}
@@ -1293,6 +1485,76 @@ export default function App() {
           )}
         </section>
       </main>
+
+      {traceModalOpen && telemetry && (() => {
+        const root = buildSpanTree(telemetry.spans);
+        const modelSpan = telemetry.spans.find((s) => s.name === "model.call");
+        const traceEvents = modelSpan ? parseTraceEvents(modelSpan) : [];
+        const inTok = modelSpan?.attributes["gen_ai.usage.input_tokens"];
+        const outTok = modelSpan?.attributes["gen_ai.usage.output_tokens"];
+        const totTok = modelSpan?.attributes["gen_ai.usage.total_tokens"];
+        const temp = modelSpan?.attributes["gen_ai.request.temperature"];
+        return (
+          <div className="modal-overlay" onClick={() => setTraceModalOpen(false)}>
+            <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2>Trace — {telemetry.run.id.slice(0, 8)}</h2>
+                <button className="secondary-button" onClick={() => setTraceModalOpen(false)}>✕</button>
+              </div>
+              <div className="modal-body">
+                {root && (() => {
+                  const rv = spanVisual(root.name, root.attributes, root.duration_ms);
+                  return (
+                    <div className="trace-tree">
+                      <div className="trace-root-row">
+                        <div className="trace-span-card" style={{ background: rv.bg }}>
+                          <strong>{root.name}</strong>
+                          <span>{rv.subtitle}</span>
+                        </div>
+                      </div>
+                      {root.children.length > 0 && (
+                        <div className="trace-children-row">
+                          {root.children
+                            .slice()
+                            .sort((a, b) => a.start_time_unix_nano - b.start_time_unix_nano)
+                            .map((child) => {
+                              const cv = spanVisual(child.name, child.attributes, child.duration_ms);
+                              return (
+                                <div key={child.id} className="trace-span-card" style={{ background: cv.bg }}>
+                                  <strong>{child.name}</strong>
+                                  <span>{cv.subtitle}</span>
+                                </div>
+                              );
+                            })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {traceEvents.length > 0 && (
+                  <div className="trace-events">
+                    <p className="trace-events-label">Events (in order)</p>
+                    {traceEvents.map((row) => (
+                      <div key={row.key} className="trace-event-card" style={{ borderLeftColor: row.bg }}>
+                        <strong>{row.title}</strong>
+                        {row.subtitle && <span>{row.subtitle}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {(inTok != null || outTok != null) && (
+                  <p className="trace-usage">
+                    Token usage: {String(inTok ?? "?")} input + {String(outTok ?? "?")} output = {String(totTok ?? "?")} total
+                    {temp != null ? ` · temp ${String(temp)}` : ""}
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

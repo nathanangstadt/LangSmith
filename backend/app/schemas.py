@@ -51,7 +51,6 @@ class AgentProfileUpdate(BaseModel):
 
 class MCPServerCreate(BaseModel):
     name: str
-    label: str
     server_url: str
     token_url: str
     grant_type: str = "client_credentials"
@@ -68,7 +67,6 @@ class MCPServerCreate(BaseModel):
 class MCPServerTestRequest(BaseModel):
     server_id: str | None = None
     name: str
-    label: str
     server_url: str
     token_url: str
     grant_type: str = "client_credentials"
@@ -83,7 +81,7 @@ class MCPServerTestRequest(BaseModel):
 
 
 class MCPServerUpdate(BaseModel):
-    label: str | None = None
+    name: str | None = None
     server_url: str | None = None
     token_url: str | None = None
     grant_type: str | None = None
@@ -136,7 +134,6 @@ class AgentProfileOut(BaseModel):
 class MCPServerOut(BaseModel):
     id: str
     name: str
-    label: str
     server_url: str
     token_url: str
     grant_type: str
@@ -177,22 +174,22 @@ class ThreadOut(BaseModel):
     messages: list[MessageOut] = Field(default_factory=list)
 
 
-class RunStepOut(BaseModel):
+class OtelSpanOut(BaseModel):
     id: str
-    run_id: str
-    step_index: int
-    kind: str
-    name: str
-    status: str
-    latency_ms: int | None
-    token_usage: dict[str, Any]
-    input_payload: dict[str, Any]
-    output_payload: dict[str, Any]
-    metadata_json: dict[str, Any]
+    run_id: str | None
+    trace_id: str
     span_id: str
     parent_span_id: str | None
-    langsmith_run_id: str | None
-    otel_span_id: str | None
+    name: str
+    kind: str
+    start_time_unix_nano: int
+    end_time_unix_nano: int
+    duration_ms: int | None
+    status_code: str
+    status_message: str
+    attributes: dict[str, Any]
+    events: list[dict[str, Any]]
+    resource_attributes: dict[str, Any]
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -211,37 +208,5 @@ class ApprovalDecisionOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class TelemetryEventOut(BaseModel):
-    id: str
-    run_id: str
-    step_id: str | None
-    event_type: str
-    trace_id: str
-    span_id: str
-    payload: dict[str, Any]
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
 
 
-class AgentRunOut(BaseModel):
-    id: str
-    thread_id: str
-    agent_profile_id: str
-    status: str
-    user_message_id: str | None
-    assistant_message_id: str | None
-    trace_id: str
-    langsmith_run_id: str | None
-    otel_trace_id: str | None
-    metadata_json: dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
-    steps: list[RunStepOut] = Field(default_factory=list)
-    approvals: list[ApprovalDecisionOut] = Field(default_factory=list)
-    telemetry: list[TelemetryEventOut] = Field(default_factory=list)
-
-
-class RunResumeResponse(BaseModel):
-    run: AgentRunOut
-    assistant_message: MessageOut | None = None

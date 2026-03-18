@@ -1,20 +1,26 @@
-import json
+import logging
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from sqlalchemy.orm import Session
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor,
+    SimpleSpanProcessor,
+    SpanExporter,
+    SpanExportResult,
+)
+from opentelemetry.trace import SpanKind, StatusCode
 
 from app.config import get_settings
-from app.models import AgentRun, RunStep, TelemetryEvent
+from app.database import db_context
+from app.models import OtelSpan
 
-
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -29,155 +35,135 @@ def _parse_headers(value: str | None) -> dict[str, str]:
     return headers
 
 
+class PostgresSpanExporter(SpanExporter):
+    """Writes completed OTEL spans verbatim to the otel_spans table."""
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        try:
+            with db_context() as db:
+                for span in spans:
+                    attrs = dict(span.attributes or {})
+                    run_id = attrs.get("agent.run_id")
+                    trace_id = format(span.context.trace_id, "032x")
+                    span_id = format(span.context.span_id, "016x")
+                    parent_span_id = (
+                        format(span.parent.span_id, "016x")
+                        if span.parent and span.parent.is_valid
+                        else None
+                    )
+                    duration_ms = None
+                    if span.start_time and span.end_time:
+                        duration_ms = int((span.end_time - span.start_time) / 1_000_000)
+                    db.add(
+                        OtelSpan(
+                            id=str(uuid.uuid4()),
+                            run_id=run_id,
+                            trace_id=trace_id,
+                            span_id=span_id,
+                            parent_span_id=parent_span_id,
+                            name=span.name,
+                            kind=span.kind.name,
+                            start_time_unix_nano=span.start_time or 0,
+                            end_time_unix_nano=span.end_time or 0,
+                            duration_ms=duration_ms,
+                            status_code=span.status.status_code.name,
+                            status_message=span.status.description or "",
+                            attributes=attrs,
+                            events=[
+                                {
+                                    "name": e.name,
+                                    "time_unix_nano": e.timestamp,
+                                    "attributes": dict(e.attributes or {}),
+                                }
+                                for e in (span.events or [])
+                            ],
+                            resource_attributes=dict(span.resource.attributes or {}),
+                        )
+                    )
+                db.commit()
+            return SpanExportResult.SUCCESS
+        except Exception:
+            logger.exception("PostgresSpanExporter: failed to write spans")
+            return SpanExportResult.FAILURE
+
+    def shutdown(self) -> None:
+        pass
+
+
+# Always create a TracerProvider. Register the Postgres exporter with a
+# SimpleSpanProcessor (synchronous) so spans land in the DB before the next
+# SSE event is emitted. Add the OTLP BatchSpanProcessor only when an endpoint
+# is configured.
+_resource = Resource.create({"service.name": settings.otel_service_name})
+_provider = TracerProvider(resource=_resource)
+_provider.add_span_processor(SimpleSpanProcessor(PostgresSpanExporter()))
 if settings.otel_exporter_otlp_endpoint:
-    provider = TracerProvider(resource=Resource.create({"service.name": settings.otel_service_name}))
-    exporter = OTLPSpanExporter(
+    _otlp_exporter = OTLPSpanExporter(
         endpoint=settings.otel_exporter_otlp_endpoint,
         headers=_parse_headers(settings.otel_exporter_otlp_headers),
     )
-    provider.add_span_processor(BatchSpanProcessor(exporter))
-    trace.set_tracer_provider(provider)
-
+    _provider.add_span_processor(BatchSpanProcessor(_otlp_exporter))
+trace.set_tracer_provider(_provider)
 
 otel_tracer = trace.get_tracer("agent_playground")
 
 
 @dataclass
-class CanonicalSpan:
-    trace_id: str
-    span_id: str
-    parent_span_id: str | None
-    name: str
+class ActiveSpan:
     kind: str
-    status: str
-    start_time: str
-    end_time: str | None = None
-    attributes: dict[str, Any] = field(default_factory=dict)
-    events: list[dict[str, Any]] = field(default_factory=list)
-    links: list[dict[str, Any]] = field(default_factory=list)
-    token_usage: dict[str, Any] = field(default_factory=dict)
-    input_payload: dict[str, Any] = field(default_factory=dict)
-    output_payload: dict[str, Any] = field(default_factory=dict)
-    langsmith_run_id: str | None = None
-    otel_span_id: str | None = None
-    local_exported: bool = True
-    langsmith_exported: bool = False
-    otel_exported: bool = False
+    span_id: str  # OTEL hex span ID — stored for convenience in SSE events
+    # _otel_span is set as a plain attribute after construction so asdict() ignores it.
 
 
 class TelemetryManager:
     def start_span(
         self,
-        run: AgentRun,
+        run: Any,
         name: str,
         kind: str,
-        parent_span_id: str | None = None,
+        parent_otel_span: Any | None = None,
         attributes: dict[str, Any] | None = None,
-        input_payload: dict[str, Any] | None = None,
-    ) -> CanonicalSpan:
-        return CanonicalSpan(
-            trace_id=run.trace_id,
-            span_id=uuid.uuid4().hex,
-            parent_span_id=parent_span_id,
-            name=name,
+    ) -> ActiveSpan:
+        otel_kind = SpanKind.CLIENT if kind == "model" else SpanKind.INTERNAL
+        parent_ctx = trace.set_span_in_context(parent_otel_span) if parent_otel_span else None
+        otel_span = otel_tracer.start_span(name, context=parent_ctx, kind=otel_kind)
+
+        otel_span.set_attribute("agent.run_id", run.id)
+        otel_span.set_attribute("agent.kind", kind)
+        for key, value in (attributes or {}).items():
+            attr_name = key if "." in key else f"agent.{key}"
+            if isinstance(value, (str, int, float, bool)):
+                otel_span.set_attribute(attr_name, value)
+
+        span = ActiveSpan(
             kind=kind,
-            status="in_progress",
-            start_time=datetime.now(timezone.utc).isoformat(),
-            attributes=attributes or {},
-            input_payload=input_payload or {},
+            span_id=format(otel_span.get_span_context().span_id, "016x"),
         )
+        span._otel_span = otel_span  # type: ignore[attr-defined]
+        return span
 
-    def end_span(
-        self,
-        db: Session,
-        run: AgentRun,
-        span: CanonicalSpan,
-        *,
-        step_index: int,
-        status: str = "completed",
-        output_payload: dict[str, Any] | None = None,
-        token_usage: dict[str, Any] | None = None,
-        metadata_json: dict[str, Any] | None = None,
-    ) -> RunStep:
-        span.status = status
-        span.end_time = datetime.now(timezone.utc).isoformat()
-        span.output_payload = output_payload or {}
-        span.token_usage = token_usage or {}
-        span.otel_exported = bool(settings.otel_exporter_otlp_endpoint)
-        event_payload = asdict(span)
-        step = RunStep(
-            run_id=run.id,
-            step_index=step_index,
-            kind=span.kind,
-            name=span.name,
-            status=status,
-            latency_ms=self._latency_ms(span.start_time, span.end_time),
-            token_usage=span.token_usage,
-            input_payload=span.input_payload,
-            output_payload=span.output_payload,
-            metadata_json=metadata_json or {},
-            span_id=span.span_id,
-            parent_span_id=span.parent_span_id,
-            langsmith_run_id=span.langsmith_run_id,
-            otel_span_id=span.otel_span_id,
-        )
-        db.add(step)
-        db.flush()
-        db.add(
-            TelemetryEvent(
-                run_id=run.id,
-                step_id=step.id,
-                event_type="span.completed",
-                trace_id=span.trace_id,
-                span_id=span.span_id,
-                payload=event_payload,
-            )
-        )
-        self._emit_otel(span)
-        return step
-
-    def record_event(
-        self,
-        db: Session,
-        *,
-        run_id: str,
-        trace_id: str,
-        span_id: str,
-        event_type: str,
-        payload: dict[str, Any],
-        step_id: str | None = None,
-    ) -> None:
-        db.add(
-            TelemetryEvent(
-                run_id=run_id,
-                step_id=step_id,
-                event_type=event_type,
-                trace_id=trace_id,
-                span_id=span_id,
-                payload=payload,
-            )
-        )
-
-    @staticmethod
-    def _latency_ms(start_time: str, end_time: str | None) -> int | None:
-        if not end_time:
-            return None
-        start_dt = datetime.fromisoformat(start_time)
-        end_dt = datetime.fromisoformat(end_time)
-        return int((end_dt - start_dt).total_seconds() * 1000)
-
-    def _emit_otel(self, span: CanonicalSpan) -> None:
-        if not settings.otel_exporter_otlp_endpoint:
+    def end_span(self, span: ActiveSpan, *, status: str = "completed") -> None:
+        otel_span = getattr(span, "_otel_span", None)
+        if otel_span is None:
             return
-        with otel_tracer.start_as_current_span(span.name) as otel_span:
-            for key, value in span.attributes.items():
-                otel_span.set_attribute(key, json.dumps(value) if isinstance(value, (dict, list)) else value)
-            otel_span.set_attribute("agent.trace_id", span.trace_id)
-            otel_span.set_attribute("agent.span_id", span.span_id)
-            otel_span.set_attribute("agent.kind", span.kind)
-            otel_span.set_attribute("agent.status", span.status)
-            span.otel_span_id = format(otel_span.get_span_context().span_id, "016x")
+        if span.kind == "model":
+            model_name = str(otel_span.attributes.get("gen_ai.request.model", ""))  # type: ignore[union-attr]
+            gen_ai_system = "anthropic" if "claude" in model_name else "openai"
+            otel_span.set_attribute("gen_ai.system", gen_ai_system)
+            otel_span.set_attribute("gen_ai.operation.name", "chat")
+        otel_span.set_status(
+            trace.Status(StatusCode.ERROR if status == "failed" else StatusCode.OK)
+        )
+        otel_span.end()  # triggers PostgresSpanExporter synchronously
+
+    def close_otel_span(self, span: ActiveSpan, *, status: str = "failed") -> None:
+        """End the OTEL span without a DB span record (for parent cleanup on error)."""
+        otel_span = getattr(span, "_otel_span", None)
+        if otel_span is not None:
+            otel_span.set_status(
+                trace.Status(StatusCode.ERROR if status == "failed" else StatusCode.OK)
+            )
+            otel_span.end()
 
 
 telemetry_manager = TelemetryManager()
-

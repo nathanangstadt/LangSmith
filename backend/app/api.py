@@ -17,8 +17,7 @@ from app.models import (
     LLMConnection,
     MCPServer,
     Message,
-    RunStep,
-    TelemetryEvent,
+    OtelSpan,
     Thread,
 )
 from app.runtime import agent_runtime
@@ -27,7 +26,6 @@ from app.schemas import (
     AgentProfileCreate,
     AgentProfileOut,
     AgentProfileUpdate,
-    AgentRunOut,
     ApprovalResolve,
     LLMConnectionCreate,
     MCPServerCreate,
@@ -37,10 +35,11 @@ from app.schemas import (
     MCPServerUpdate,
     MessageCreate,
     MessageOut,
-    RunResumeResponse,
+    OtelSpanOut,
     ThreadCreate,
     ThreadOut,
 )
+
 from app.security import secret_box
 
 
@@ -75,8 +74,7 @@ async def _test_server_config(server: MCPServer) -> dict[str, Any]:
 def _delete_thread_records(db: Session, thread_id: str) -> None:
     run_ids = [run_id for (run_id,) in db.query(AgentRun.id).filter(AgentRun.thread_id == thread_id).all()]
     if run_ids:
-        db.execute(delete(TelemetryEvent).where(TelemetryEvent.run_id.in_(run_ids)))
-        db.execute(delete(RunStep).where(RunStep.run_id.in_(run_ids)))
+        db.execute(delete(OtelSpan).where(OtelSpan.run_id.in_(run_ids)))
         db.execute(delete(ApprovalDecision).where(ApprovalDecision.run_id.in_(run_ids)))
         db.execute(delete(AgentRun).where(AgentRun.id.in_(run_ids)))
     db.execute(delete(Message).where(Message.thread_id == thread_id))
@@ -195,14 +193,13 @@ def import_agent_md(payload: AgentMdImportRequest, db: Session = Depends(get_db)
     )
     db.add(profile)
     for server in fm.get("mcp_servers", []):
-        key = server.get("key") or server.get("label", "mcp-server").lower().replace(" ", "_")
+        key = server.get("key") or server.get("name", "mcp-server").lower().replace(" ", "_")
         existing = db.query(MCPServer).filter(MCPServer.name == key).one_or_none()
         if existing:
             continue
         db.add(
             MCPServer(
                 name=key,
-                label=server.get("label", key),
                 server_url=server.get("server_url", ""),
                 token_url=server.get("token_url", ""),
                 grant_type=server.get("auth", {}).get("grant_type", "client_credentials"),
@@ -232,7 +229,6 @@ def export_agent_md_endpoint(profile_id: str, db: Session = Depends(get_db)) -> 
 def create_mcp_server(payload: MCPServerCreate, db: Session = Depends(get_db)) -> MCPServer:
     server = MCPServer(
         name=payload.name,
-        label=payload.label,
         server_url=payload.server_url,
         token_url=payload.token_url,
         grant_type=payload.grant_type,
@@ -321,7 +317,6 @@ async def test_mcp_server_draft(payload: MCPServerTestRequest, db: Session = Dep
     server = MCPServer(
         id="draft",
         name=payload.name,
-        label=payload.label,
         server_url=payload.server_url,
         token_url=payload.token_url,
         grant_type=payload.grant_type,
@@ -445,13 +440,13 @@ async def create_message_and_run(
     return StreamingResponse(generator, media_type="text/event-stream")
 
 
-@router.post("/runs/{run_id}/approvals/{approval_id}", response_model=RunResumeResponse)
+@router.post("/runs/{run_id}/approvals/{approval_id}")
 async def resolve_approval(
     run_id: str,
     approval_id: str,
     payload: ApprovalResolve,
     db: Session = Depends(get_db),
-) -> RunResumeResponse:
+) -> dict[str, Any]:
     run = db.query(AgentRun).filter(AgentRun.id == run_id).one_or_none()
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -478,27 +473,10 @@ async def resolve_approval(
         if pending == 0:
             assistant_message = await agent_runtime.resume_run(db, run)
             db.refresh(run)
-    telemetry = list(db.query(TelemetryEvent).filter(TelemetryEvent.run_id == run.id).order_by(TelemetryEvent.created_at))
-    return RunResumeResponse(
-        run=AgentRunOut(
-            id=run.id,
-            thread_id=run.thread_id,
-            agent_profile_id=run.agent_profile_id,
-            status=run.status,
-            user_message_id=run.user_message_id,
-            assistant_message_id=run.assistant_message_id,
-            trace_id=run.trace_id,
-            langsmith_run_id=run.langsmith_run_id,
-            otel_trace_id=run.otel_trace_id,
-            metadata_json=run.metadata_json,
-            created_at=run.created_at,
-            updated_at=run.updated_at,
-            steps=[],
-            approvals=[],
-            telemetry=[],
-        ),
-        assistant_message=MessageOut.model_validate(assistant_message) if assistant_message else None,
-    )
+    return {
+        "run": {"id": run.id, "status": run.status},
+        "assistant_message": MessageOut.model_validate(assistant_message).model_dump() if assistant_message else None,
+    }
 
 
 @router.get("/runs/{run_id}/telemetry")
@@ -506,9 +484,8 @@ def get_run_telemetry(run_id: str, db: Session = Depends(get_db)) -> dict[str, A
     run = db.query(AgentRun).filter(AgentRun.id == run_id).one_or_none()
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    steps = list(db.query(RunStep).filter_by(run_id=run_id).order_by(RunStep.step_index))
+    spans = list(db.query(OtelSpan).filter_by(run_id=run_id).order_by(OtelSpan.start_time_unix_nano))
     approvals = list(db.query(ApprovalDecision).filter_by(run_id=run_id).order_by(ApprovalDecision.created_at))
-    telemetry = list(db.query(TelemetryEvent).filter_by(run_id=run_id).order_by(TelemetryEvent.created_at))
     return {
         "run": {
             "id": run.id,
@@ -516,30 +493,9 @@ def get_run_telemetry(run_id: str, db: Session = Depends(get_db)) -> dict[str, A
             "agent_profile_id": run.agent_profile_id,
             "status": run.status,
             "trace_id": run.trace_id,
-            "langsmith_run_id": run.langsmith_run_id,
-            "otel_trace_id": run.otel_trace_id,
             "metadata_json": run.metadata_json,
         },
-        "steps": [
-            {
-                "id": step.id,
-                "step_index": step.step_index,
-                "kind": step.kind,
-                "name": step.name,
-                "status": step.status,
-                "latency_ms": step.latency_ms,
-                "token_usage": step.token_usage,
-                "input_payload": step.input_payload,
-                "output_payload": step.output_payload,
-                "metadata_json": step.metadata_json,
-                "span_id": step.span_id,
-                "parent_span_id": step.parent_span_id,
-                "langsmith_run_id": step.langsmith_run_id,
-                "otel_span_id": step.otel_span_id,
-                "created_at": step.created_at.isoformat(),
-            }
-            for step in steps
-        ],
+        "spans": [OtelSpanOut.model_validate(span).model_dump() for span in spans],
         "approvals": [
             {
                 "id": approval.id,
@@ -550,15 +506,70 @@ def get_run_telemetry(run_id: str, db: Session = Depends(get_db)) -> dict[str, A
             }
             for approval in approvals
         ],
-        "telemetry": [
+    }
+
+
+def _otlp_value(v: Any) -> dict[str, Any]:
+    if isinstance(v, bool):
+        return {"boolValue": v}
+    if isinstance(v, int):
+        return {"intValue": v}
+    if isinstance(v, float):
+        return {"doubleValue": v}
+    if isinstance(v, list):
+        return {"arrayValue": {"values": [_otlp_value(i) for i in v]}}
+    return {"stringValue": str(v)}
+
+
+def _otlp_attrs(attrs: dict[str, Any]) -> list[dict[str, Any]]:
+    return [{"key": k, "value": _otlp_value(v)} for k, v in attrs.items()]
+
+
+_SPAN_KIND_MAP = {"INTERNAL": 1, "SERVER": 2, "CLIENT": 3, "PRODUCER": 4, "CONSUMER": 5}
+_STATUS_CODE_MAP = {"UNSET": 0, "OK": 1, "ERROR": 2}
+
+
+@router.get("/runs/{run_id}/otel-export")
+def export_run_otel(run_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    spans = list(db.query(OtelSpan).filter_by(run_id=run_id).order_by(OtelSpan.start_time_unix_nano))
+    otlp_spans = []
+    for span in spans:
+        otlp_span: dict[str, Any] = {
+            "traceId": span.trace_id,
+            "spanId": span.span_id,
+            "name": span.name,
+            "kind": _SPAN_KIND_MAP.get(span.kind, 1),
+            "startTimeUnixNano": str(span.start_time_unix_nano),
+            "endTimeUnixNano": str(span.end_time_unix_nano),
+            "attributes": _otlp_attrs(span.attributes),
+            "events": [
+                {
+                    "timeUnixNano": str(e.get("time_unix_nano", 0)),
+                    "name": e.get("name", ""),
+                    "attributes": _otlp_attrs(e.get("attributes", {})),
+                }
+                for e in (span.events or [])
+            ],
+            "status": {"code": _STATUS_CODE_MAP.get(span.status_code, 0), "message": span.status_message},
+        }
+        if span.parent_span_id:
+            otlp_span["parentSpanId"] = span.parent_span_id
+        otlp_spans.append(otlp_span)
+
+    resource_attrs = spans[0].resource_attributes if spans else {"service.name": "agent_playground"}
+    return {
+        "resourceSpans": [
             {
-                "id": event.id,
-                "event_type": event.event_type,
-                "trace_id": event.trace_id,
-                "span_id": event.span_id,
-                "payload": event.payload,
-                "created_at": event.created_at.isoformat(),
+                "resource": {"attributes": _otlp_attrs(resource_attrs)},
+                "scopeSpans": [
+                    {
+                        "scope": {"name": "agent_playground"},
+                        "spans": otlp_spans,
+                    }
+                ],
             }
-            for event in telemetry
-        ],
+        ]
     }
