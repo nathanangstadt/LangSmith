@@ -72,9 +72,6 @@ class AgentRuntime:
             parts.append(f"Guidelines:\n{profile.guidelines}")
         if profile.output_style:
             parts.append(f"Output Style:\n{profile.output_style}")
-        parts.append(
-            "Use tools when appropriate. Keep intermediate reasoning private and summarize tool-backed claims explicitly."
-        )
         return "\n\n".join(parts)
 
     def _conversation_input(self, messages: list[Message]) -> list[dict[str, Any]]:
