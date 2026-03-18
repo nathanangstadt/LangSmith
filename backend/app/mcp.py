@@ -56,17 +56,17 @@ async def fetch_access_token(server: MCPServer) -> tuple[str, dict[str, Any]]:
 
 async def build_openai_mcp_tool(server: MCPServer) -> tuple[dict[str, Any], dict[str, Any]]:
     token, token_meta = await fetch_access_token(server)
+    headers = dict(server.headers or {})
+    headers["Authorization"] = f"Bearer {token}"
     tool = {
         "type": "mcp",
         "server_label": server.name,
         "server_url": server.server_url,
-        "authorization": f"Bearer {token}",
         "require_approval": "always" if server.approval_mode == "prompt" else "never",
+        "headers": headers,
     }
     if server.allowed_tools:
         tool["allowed_tools"] = server.allowed_tools
-    if server.headers:
-        tool["headers"] = server.headers
     return tool, token_meta
 
 
