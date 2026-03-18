@@ -50,7 +50,7 @@ type ServerTestState = {
 
 type DetailedActivityItem = {
   key: string;
-  role: "system" | "user" | "assistant" | "tool_request" | "tool_response";
+  role: "system" | "user" | "assistant" | "assistant_context" | "tool_request" | "tool_response";
   label: string;
   body: string;
   raw: Record<string, unknown>;
@@ -333,6 +333,26 @@ export default function App() {
   ): DetailedActivityItem[] => {
     const type = String(item.type ?? "event");
     const itemKey = String(item.id ?? fallbackKey);
+    if (type === "reasoning") {
+      const summaries = Array.isArray(item.summary) ? item.summary : [];
+      const summaryText = summaries
+        .map((entry) => {
+          if (typeof entry === "string") return entry;
+          if (entry && typeof entry === "object" && "text" in entry) return String(entry.text ?? "");
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n");
+      if (!summaryText) return [];
+      return [{
+        key: itemKey,
+        role: "assistant_context",
+        label: "Assistant Context",
+        body: summaryText,
+        raw: item,
+        order,
+      }];
+    }
     if (type === "mcp_call") {
       const toolName = String(item.name ?? "unknown");
       const serverLabel = String(item.server_label ?? "MCP");
@@ -1110,6 +1130,10 @@ export default function App() {
                   <article key={item.key} className={`message exchange ${item.role}`}>
                     <header>{item.label}</header>
                     <pre>{item.body}</pre>
+                    <details>
+                      <summary>Raw</summary>
+                      <pre>{JSON.stringify(item.raw, null, 2)}</pre>
+                    </details>
                   </article>
                 ))
               : selectedThread?.messages.map((message) => (

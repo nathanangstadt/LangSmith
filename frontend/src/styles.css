@@ -432,6 +432,11 @@ button.list-item {
   background: #f8f3ea;
 }
 
+.message.assistant_context {
+  background: #f3efe7;
+  border-color: rgba(114, 92, 62, 0.16);
+}
+
 .message.system {
   background: #eef2f6;
 }
@@ -448,6 +453,17 @@ button.list-item {
 .message.waiting {
   border-style: dashed;
   color: #52606d;
+}
+
+.message details {
+  margin-top: 0.55rem;
+}
+
+.message summary {
+  cursor: pointer;
+  color: #52606d;
+  font-size: 0.82rem;
+  font-weight: 600;
 }
 
 .composer,
