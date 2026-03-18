@@ -545,10 +545,17 @@ def resolve_approval(
 
 @router.post("/runs/{run_id}/resume")
 def resume_run_stream(run_id: str, db: Session = Depends(get_db)) -> StreamingResponse:
-    # Verify the run exists before handing off to the streaming generator.
+    # Verify the run exists and all approvals are resolved before streaming.
     run = db.query(AgentRun).filter(AgentRun.id == run_id).one_or_none()
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
+    pending = (
+        db.query(ApprovalDecision)
+        .filter(ApprovalDecision.run_id == run_id, ApprovalDecision.status == "pending")
+        .count()
+    )
+    if pending > 0:
+        raise HTTPException(status_code=409, detail=f"Run has {pending} pending approval(s)")
 
     # Reconstruct the original react.run span as a non-recording parent so that
     # react.resume appears as a child in the same Jaeger trace.

@@ -47,11 +47,14 @@ async def fetch_access_token(server: MCPServer) -> tuple[str, dict[str, Any]]:
         "grant_type": server.grant_type,
         "client_id": secret_box.decrypt(server.client_id_encrypted),
         "client_secret": secret_box.decrypt(server.client_secret_encrypted),
-        "scope": server.scope,
     }
+    if server.scope:
+        payload["scope"] = server.scope
     timeout = httpx.Timeout(server.timeout_ms / 1000)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(server.token_url, data=payload, headers=server.headers or None)
+        # Use no custom headers for the token request — server.headers are MCP
+        # API headers (e.g. x-tenant) and must not be forwarded to the token issuer.
+        response = await client.post(server.token_url, data=payload)
         response.raise_for_status()
         data = response.json()
         token = data["access_token"]
@@ -101,7 +104,7 @@ def _extract_json_payload(response: httpx.Response) -> dict[str, Any]:
         payload_lines = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
         if payload_lines:
             return json.loads("".join(payload_lines))
-    return response.json()
+    return {}
 
 
 async def discover_mcp_tools(server: MCPServer) -> tuple[list[str], dict[str, Any]]:

@@ -1,4 +1,5 @@
 import logging
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -91,11 +92,26 @@ class PostgresSpanExporter(SpanExporter):
 
 
 class GatedOTLPExporter(SpanExporter):
-    """Wraps OTLPSpanExporter and only forwards spans when active=True."""
+    """Wraps OTLPSpanExporter and only forwards spans when active=True.
+
+    active is read by the BatchSpanProcessor background thread and written by
+    the toggle endpoint request thread, so access is guarded by a lock.
+    """
 
     def __init__(self, inner: OTLPSpanExporter) -> None:
         self._inner = inner
-        self.active: bool = False
+        self._lock = threading.Lock()
+        self._active: bool = False
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._active
+
+    @active.setter
+    def active(self, value: bool) -> None:
+        with self._lock:
+            self._active = value
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         if not self.active:
@@ -186,7 +202,9 @@ class TelemetryManager:
         otel_span.end()  # triggers PostgresSpanExporter synchronously
 
     def close_otel_span(self, span: ActiveSpan, *, status: str = "failed") -> None:
-        """End the OTEL span without a DB span record (for parent cleanup on error)."""
+        """End the OTEL span (writes to DB) without the model-specific gen_ai
+        attributes that end_span adds. Used to close the root span when a child
+        span is the designated failure span."""
         otel_span = getattr(span, "_otel_span", None)
         if otel_span is not None:
             otel_span.set_status(
