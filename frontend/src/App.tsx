@@ -50,9 +50,9 @@ type ServerTestState = {
 
 type DetailedActivityItem = {
   key: string;
-  title: string;
-  subtitle: string;
-  body?: string;
+  role: "system" | "user" | "assistant" | "tool_request" | "tool_response";
+  label: string;
+  body: string;
   raw: Record<string, unknown>;
   order?: number;
 };
@@ -271,86 +271,104 @@ export default function App() {
     }));
   };
 
-  const buildDetailedItems = (
+  const contentText = (content: unknown, textKey: "text" | "input_text" = "text") => {
+    if (!Array.isArray(content)) return "";
+    return content
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") return "";
+        if (textKey in entry) return String(entry[textKey as keyof typeof entry] ?? "");
+        if ("text" in entry) return String(entry.text ?? "");
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  };
+
+  const buildInputDetailedItems = (
+    instructions: string,
+    inputItems: Record<string, unknown>[],
+    orderBase = 0,
+  ): DetailedActivityItem[] => {
+    const items: DetailedActivityItem[] = [];
+    if (instructions.trim()) {
+      items.push({
+        key: "system-instructions",
+        role: "system",
+        label: "System",
+        body: instructions,
+        raw: { type: "instructions", instructions },
+        order: orderBase,
+      });
+    }
+    inputItems.forEach((item, index) => {
+      const role = String(item.role ?? "user");
+      const body = contentText(item.content, "text");
+      if (!body) return;
+      items.push({
+        key: `input-${index}`,
+        role: role === "assistant" ? "assistant" : "user",
+        label: role === "assistant" ? "Assistant Context" : "User",
+        body,
+        raw: item,
+        order: orderBase + index + 1,
+      });
+    });
+    return items;
+  };
+
+  const buildOutputDetailedItems = (
     item: Record<string, unknown>,
     fallbackKey: string,
     order?: number,
   ): DetailedActivityItem[] => {
     const type = String(item.type ?? "event");
     const itemKey = String(item.id ?? fallbackKey);
-    if (type === "reasoning") {
-      const summaries = Array.isArray(item.summary) ? item.summary : [];
-      const summaryText = summaries
-        .map((entry) => {
-          if (typeof entry === "string") return entry;
-          if (entry && typeof entry === "object" && "text" in entry) return String(entry.text ?? "");
-          return "";
-        })
-        .filter(Boolean)
-        .join("\n");
-      if (!summaryText) return [];
-      return [{
-        key: itemKey,
-        title: "Reasoning Summary",
-        subtitle: "Model",
-        body: summaryText,
-        raw: item,
-        order,
-      }];
-    }
-    if (type === "mcp_list_tools") {
-      const tools = Array.isArray(item.tools) ? item.tools : [];
-      const toolNames = tools
-        .map((tool) => (tool && typeof tool === "object" ? String(tool.name ?? "unknown") : "unknown"))
-        .join(", ");
-      return [{
-        key: itemKey,
-        title: "Imported MCP Tools",
-        subtitle: String(item.server_label ?? "MCP server"),
-        body: toolNames || "Loading tools...",
-        raw: item,
-        order,
-      }];
-    }
     if (type === "mcp_call") {
-      const status = String(item.status ?? "in_progress");
-      const output = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? {}, null, 2);
+      const toolName = String(item.name ?? "unknown");
+      const serverLabel = String(item.server_label ?? "MCP");
       const argumentsText = typeof item.arguments === "string" ? item.arguments : "";
-      return [{
-        key: itemKey,
-        title: `Tool Call: ${String(item.name ?? "unknown")}`,
-        subtitle: `${String(item.server_label ?? "MCP")} · ${status}`,
-        body: output || argumentsText || "Calling tool...",
+      const output = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? {}, null, 2);
+      const entries: DetailedActivityItem[] = [{
+        key: `${itemKey}:request`,
+        role: "tool_request",
+        label: `Tool Request · ${toolName}`,
+        body: argumentsText || "Calling tool...",
         raw: item,
         order,
       }];
+      if (output) {
+        entries.push({
+          key: `${itemKey}:response`,
+          role: "tool_response",
+          label: `Tool Response · ${toolName}`,
+          body: output,
+          raw: item,
+          order: typeof order === "number" ? order + 0.1 : order,
+        });
+      } else if (String(item.status ?? "") === "completed") {
+        entries.push({
+          key: `${itemKey}:response`,
+          role: "tool_response",
+          label: `Tool Response · ${toolName}`,
+          body: "Tool completed with no returned content.",
+          raw: item,
+          order: typeof order === "number" ? order + 0.1 : order,
+        });
+      }
+      return entries.map((entry) => ({ ...entry, raw: { ...item, server_label: serverLabel } }));
     }
     if (type === "message") {
-      const content = Array.isArray(item.content)
-        ? item.content
-            .map((entry) => {
-              if (!entry || typeof entry !== "object") return "";
-              return String(entry.text ?? "");
-            })
-            .filter(Boolean)
-            .join("\n")
-        : "";
+      const body = contentText(item.content);
       return [{
         key: itemKey,
-        title: "Assistant Output",
-        subtitle: String(item.status ?? "completed"),
-        body: content,
+        role: "assistant",
+        label: "Assistant",
+        body: body || "",
         raw: item,
         order,
       }];
     }
-    return [{
-      key: itemKey,
-      title: `Response Item: ${type}`,
-      subtitle: "Model",
-      raw: item,
-      order,
-    }];
+    return [];
   };
 
   const upsertLiveDetailedItems = (items: DetailedActivityItem[]) => {
@@ -689,11 +707,18 @@ export default function App() {
           setStatusLine(`Run ${String(payload.kind ?? "step")}`);
           if (runId) void refreshTelemetry(runId);
         }
+        if (eventName === "run.detail.input") {
+          const instructions = String(payload.instructions ?? "");
+          const inputItems = Array.isArray(payload.input_items)
+            ? (payload.input_items as Record<string, unknown>[])
+            : [];
+          upsertLiveDetailedItems(buildInputDetailedItems(instructions, inputItems));
+        }
         if (eventName === "run.detail.item") {
           const item = payload.item;
           if (item && typeof item === "object") {
             upsertLiveDetailedItems(
-              buildDetailedItems(
+              buildOutputDetailedItems(
                 item as Record<string, unknown>,
                 `${String(payload.output_index ?? "item")}`,
                 Number(payload.sequence_number ?? Number.MAX_SAFE_INTEGER),
@@ -707,8 +732,8 @@ export default function App() {
           if (snapshot) {
             upsertLiveDetailedItems([{
               key: itemId,
-              title: "Assistant Output",
-              subtitle: "Streaming",
+              role: "assistant",
+              label: "Assistant",
               body: snapshot,
               raw: {
                 type: "message",
@@ -782,17 +807,25 @@ export default function App() {
     detailedMessagesEnabled && telemetry?.run.thread_id === selectedThreadId
       ? telemetry.steps.flatMap<DetailedActivityItem>((step) => {
           if (step.kind !== "model") return [];
+          const instructions = typeof step.input_payload.instructions === "string" ? step.input_payload.instructions : "";
+          const inputItems = Array.isArray(step.input_payload.input_items)
+            ? (step.input_payload.input_items as Record<string, unknown>[])
+            : [];
           const responseItems = Array.isArray(step.output_payload.response_items)
             ? (step.output_payload.response_items as Record<string, unknown>[])
             : [];
-          return responseItems.flatMap<DetailedActivityItem>((item, index) => {
-            return buildDetailedItems(item, `${step.id}-${index}`, step.step_index * 1000 + index);
-          });
+          return [
+            ...buildInputDetailedItems(instructions, inputItems, step.step_index * 1000),
+            ...responseItems.flatMap<DetailedActivityItem>((item, index) => {
+              return buildOutputDetailedItems(item, `${step.id}-${index}`, step.step_index * 1000 + 100 + index);
+            }),
+          ];
         })
       : [];
 
   const detailedActivity: DetailedActivityItem[] = detailedMessagesEnabled
     ? Array.from(new Map([...liveDetailedActivity, ...persistedDetailedActivity].map((item) => [item.key, item])).values())
+        .sort((left, right) => (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER))
     : [];
 
   const hasStreamingAssistantMessage = Boolean(
@@ -896,7 +929,7 @@ export default function App() {
               onChange={(e) => onProfileUiField("detailed_messages_enabled", e.target.checked)}
             />
           </div>
-          <p className="helper-text">Show tool imports, tool calls, and model response items for this profile.</p>
+          <p className="helper-text">Show the full LLM exchange for this profile instead of only the final assistant reply.</p>
           <div className="row-actions">
             <div className="action-row">
               <button onClick={onCreateProfile}>{selectedProfileId ? "Save Changes" : "Save Profile"}</button>
@@ -1058,12 +1091,19 @@ export default function App() {
           </div>
 
           <div className="messages">
-            {selectedThread?.messages.map((message) => (
-              <article key={message.id} className={`message ${message.role}`}>
-                <header>{message.role}</header>
-                <pre>{message.content}</pre>
-              </article>
-            ))}
+            {detailedMessagesEnabled
+              ? detailedActivity.map((item) => (
+                  <article key={item.key} className={`message exchange ${item.role}`}>
+                    <header>{item.label}</header>
+                    <pre>{item.body}</pre>
+                  </article>
+                ))
+              : selectedThread?.messages.map((message) => (
+                  <article key={message.id} className={`message ${message.role}`}>
+                    <header>{message.role}</header>
+                    <pre>{message.content}</pre>
+                  </article>
+                ))}
             {waitingThreadId === selectedThreadId && !hasStreamingAssistantMessage && (
               <article className="message assistant waiting">
                 <header>assistant</header>
@@ -1071,34 +1111,6 @@ export default function App() {
               </article>
             )}
           </div>
-
-          {detailedMessagesEnabled && (
-            <section className="detailed-activity">
-              <div className="panel-header compact-header">
-                <h3>Detailed Messages</h3>
-                <span className="muted">Content and tool activity for the current run</span>
-              </div>
-              {detailedActivity.length > 0 ? (
-                <div className="activity-list">
-                  {detailedActivity.map((item) => (
-                    <article key={item.key} className="activity-card">
-                      <header>
-                        <strong>{item.title}</strong>
-                        <span className="timeline-kind">{item.subtitle}</span>
-                      </header>
-                      {"body" in item && item.body && <pre>{item.body}</pre>}
-                      <details>
-                        <summary>Raw item</summary>
-                        <pre>{JSON.stringify(item.raw, null, 2)}</pre>
-                      </details>
-                    </article>
-                  ))}
-                </div>
-              ) : (
-                <p className="helper-text">Run the agent to populate detailed activity.</p>
-              )}
-            </section>
-          )}
 
           {pendingApprovals.length > 0 && (
             <section className="approval-box">

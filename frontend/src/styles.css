@@ -432,30 +432,21 @@ button.list-item {
   background: #f8f3ea;
 }
 
+.message.system {
+  background: #eef2f6;
+}
+
+.message.tool_request {
+  background: #eef6ff;
+}
+
+.message.tool_response {
+  background: #eef6f0;
+}
+
 .message.waiting {
   border-style: dashed;
   color: #52606d;
-}
-
-.detailed-activity,
-.activity-list {
-  display: grid;
-  gap: 0.75rem;
-}
-
-.activity-card {
-  border-radius: 16px;
-  padding: 0.75rem;
-  background: rgba(243, 247, 251, 0.95);
-  border: 1px solid rgba(25, 33, 38, 0.1);
-}
-
-.activity-card header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 0.45rem;
 }
 
 .composer,

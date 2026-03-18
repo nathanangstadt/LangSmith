@@ -389,7 +389,11 @@ class AgentRuntime:
                 kind="model",
                 parent_span_id=root_span.span_id,
                 attributes={"model": profile.model_name, "tool_count": len(tools)},
-                input_payload={"tools": [tool["server_label"] for tool in tools]},
+                input_payload={
+                    "instructions": self._prompt(profile),
+                    "input_items": self._conversation_input(messages),
+                    "tools": [tool["server_label"] for tool in tools],
+                },
             )
             assistant_message = Message(
                 thread_id=thread.id,
@@ -401,6 +405,15 @@ class AgentRuntime:
             db.flush()
             run.assistant_message_id = assistant_message.id
             yield self._event("run.step.started", {"run_id": run.id, "kind": "model", "span_id": model_span.span_id})
+            yield self._event(
+                "run.detail.input",
+                {
+                    "run_id": run.id,
+                    "kind": "model",
+                    "instructions": self._prompt(profile),
+                    "input_items": self._conversation_input(messages),
+                },
+            )
             streamed_output_text = ""
             queued_events: asyncio.Queue[str] = asyncio.Queue()
 
