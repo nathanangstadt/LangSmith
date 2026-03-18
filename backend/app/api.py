@@ -58,9 +58,15 @@ async def _test_server_config(server: MCPServer) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"MCP connection failed: {exc}")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"MCP tool discovery failed: {exc}")
+    redacted_tool = dict(tool)
+    if isinstance(redacted_tool.get("headers"), dict):
+        redacted_headers = dict(redacted_tool["headers"])
+        if "Authorization" in redacted_headers:
+            redacted_headers["Authorization"] = "<redacted>"
+        redacted_tool["headers"] = redacted_headers
     return {
         "ok": True,
-        "tool": tool | {"authorization": "<redacted>"},
+        "tool": redacted_tool,
         "token_meta": meta,
         "discovered_tools": discovered_tools,
     }

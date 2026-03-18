@@ -14,7 +14,10 @@ export type AgentProfile = {
     otel_enabled?: boolean;
     otel_service_name?: string;
   };
-  ui_json: Record<string, unknown>;
+  ui_json: {
+    detailed_messages_enabled?: boolean;
+    [key: string]: unknown;
+  };
 };
 
 export type MCPServer = {
@@ -58,6 +61,8 @@ export type Thread = {
 export type RunTelemetry = {
   run: {
     id: string;
+    thread_id?: string;
+    agent_profile_id?: string;
     status: string;
     trace_id: string;
     langsmith_run_id?: string | null;

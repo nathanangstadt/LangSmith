@@ -90,6 +90,15 @@ class AgentRuntime:
         return input_items
 
     @staticmethod
+    def _response_output_items(response: Any) -> list[dict[str, Any]]:
+        try:
+            payload = response.model_dump()
+        except Exception:
+            return []
+        output = payload.get("output", [])
+        return output if isinstance(output, list) else []
+
+    @staticmethod
     def _supports_temperature(model_name: str) -> bool:
         return not model_name.startswith("gpt-5")
 
@@ -279,6 +288,7 @@ class AgentRuntime:
                 "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
             }
             response_id = getattr(response, "id", None)
+            response_output_items = self._response_output_items(response)
             model_step = telemetry_manager.end_span(
                 db,
                 run,
@@ -287,6 +297,7 @@ class AgentRuntime:
                 output_payload={
                     "response_id": response_id,
                     "output_text": output_text,
+                    "response_items": response_output_items,
                     "token_meta": token_meta,
                     "used_mcp_fallback": used_mcp_fallback,
                 },

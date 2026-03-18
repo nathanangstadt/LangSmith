@@ -18,7 +18,9 @@ const defaultProfileForm = {
     otel_enabled: true,
     otel_service_name: "agent-playground",
   },
-  ui_json: {},
+  ui_json: {
+    detailed_messages_enabled: false,
+  },
 };
 
 const defaultMcpForm = {
@@ -44,6 +46,14 @@ type ServerTestState = {
   status: "idle" | "success" | "error";
   message: string;
   tools: string[];
+};
+
+type DetailedActivityItem = {
+  key: string;
+  title: string;
+  subtitle: string;
+  body?: string;
+  raw: Record<string, unknown>;
 };
 
 export default function App() {
@@ -131,6 +141,7 @@ export default function App() {
       .split(".")
       .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
       .join(" / ");
+  const detailedMessagesEnabled = Boolean(selectedProfile?.ui_json?.detailed_messages_enabled);
 
   useEffect(() => {
     if (!selectedProfile) return;
@@ -154,7 +165,10 @@ export default function App() {
         otel_enabled: selectedProfile.telemetry_json.otel_enabled ?? true,
         otel_service_name: selectedProfile.telemetry_json.otel_service_name ?? "agent-playground",
       },
-      ui_json: selectedProfile.ui_json ?? {},
+      ui_json: {
+        detailed_messages_enabled: Boolean(selectedProfile.ui_json?.detailed_messages_enabled),
+        ...(selectedProfile.ui_json ?? {}),
+      },
     });
   }, [selectedProfileId, selectedProfile]);
 
@@ -232,6 +246,16 @@ export default function App() {
 
   const onProfileField = (key: string, value: string | number) => {
     setProfileForm((current) => ({ ...current, [key]: value }));
+  };
+
+  const onProfileUiField = (key: string, value: boolean) => {
+    setProfileForm((current) => ({
+      ...current,
+      ui_json: {
+        ...(current.ui_json ?? {}),
+        [key]: value,
+      },
+    }));
   };
 
   const toggleMenu = (section: "profiles" | "threads" | "servers", id: string) => {
@@ -615,6 +639,86 @@ export default function App() {
     }
   };
 
+  const detailedActivity: DetailedActivityItem[] =
+    detailedMessagesEnabled && telemetry?.run.thread_id === selectedThreadId
+      ? telemetry.steps.flatMap<DetailedActivityItem>((step) => {
+          if (step.kind !== "model") return [];
+          const responseItems = Array.isArray(step.output_payload.response_items)
+            ? (step.output_payload.response_items as Record<string, unknown>[])
+            : [];
+          return responseItems.flatMap<DetailedActivityItem>((item, index) => {
+            const type = String(item.type ?? "event");
+            if (type === "reasoning") {
+              const summaries = Array.isArray(item.summary) ? item.summary : [];
+              const summaryText = summaries
+                .map((entry) => {
+                  if (typeof entry === "string") return entry;
+                  if (entry && typeof entry === "object" && "text" in entry) return String(entry.text ?? "");
+                  return "";
+                })
+                .filter(Boolean)
+                .join("\n");
+              if (!summaryText) return [];
+              return [{
+                key: `${step.id}-${index}`,
+                title: "Reasoning Summary",
+                subtitle: "Model",
+                body: summaryText,
+                raw: item,
+              }];
+            }
+            if (type === "mcp_list_tools") {
+              const tools = Array.isArray(item.tools) ? item.tools : [];
+              const toolNames = tools
+                .map((tool) => (tool && typeof tool === "object" ? String(tool.name ?? "unknown") : "unknown"))
+                .join(", ");
+              return [{
+                key: `${step.id}-${index}`,
+                title: "Imported MCP Tools",
+                subtitle: String(item.server_label ?? "MCP server"),
+                body: toolNames || "No tools returned.",
+                raw: item,
+              }];
+            }
+            if (type === "mcp_call") {
+              const output = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? {}, null, 2);
+              return [{
+                key: `${step.id}-${index}`,
+                title: `Tool Call: ${String(item.name ?? "unknown")}`,
+                subtitle: `${String(item.server_label ?? "MCP")} · ${String(item.status ?? "completed")}`,
+                body: output,
+                raw: item,
+              }];
+            }
+            if (type === "message") {
+              const content = Array.isArray(item.content)
+                ? item.content
+                    .map((entry) => {
+                      if (!entry || typeof entry !== "object") return "";
+                      return String(entry.text ?? "");
+                    })
+                    .filter(Boolean)
+                    .join("\n")
+                : "";
+              return [{
+                key: `${step.id}-${index}`,
+                title: "Assistant Output",
+                subtitle: String(item.status ?? "completed"),
+                body: content,
+                raw: item,
+              }];
+            }
+            return [{
+              key: `${step.id}-${index}`,
+              title: `Response Item: ${type}`,
+              subtitle: "Model",
+              body: undefined,
+              raw: item,
+            }];
+          });
+        })
+      : [];
+
   return (
     <div className="shell">
       <aside
@@ -703,6 +807,16 @@ export default function App() {
             value={profileForm.max_iterations}
             onChange={(e) => onProfileField("max_iterations", Number(e.target.value))}
           />
+          <div className="toggle-row">
+            <label htmlFor="profile-detailed-messages">Detailed Messages</label>
+            <input
+              id="profile-detailed-messages"
+              type="checkbox"
+              checked={Boolean(profileForm.ui_json?.detailed_messages_enabled)}
+              onChange={(e) => onProfileUiField("detailed_messages_enabled", e.target.checked)}
+            />
+          </div>
+          <p className="helper-text">Show tool imports, tool calls, and model response items for this profile.</p>
           <div className="row-actions">
             <div className="action-row">
               <button onClick={onCreateProfile}>{selectedProfileId ? "Save Changes" : "Save Profile"}</button>
@@ -877,6 +991,34 @@ export default function App() {
               </article>
             )}
           </div>
+
+          {detailedMessagesEnabled && (
+            <section className="detailed-activity">
+              <div className="panel-header compact-header">
+                <h3>Detailed Messages</h3>
+                <span className="muted">Content and tool activity for the current run</span>
+              </div>
+              {detailedActivity.length > 0 ? (
+                <div className="activity-list">
+                  {detailedActivity.map((item) => (
+                    <article key={item.key} className="activity-card">
+                      <header>
+                        <strong>{item.title}</strong>
+                        <span className="timeline-kind">{item.subtitle}</span>
+                      </header>
+                      {"body" in item && item.body && <pre>{item.body}</pre>}
+                      <details>
+                        <summary>Raw item</summary>
+                        <pre>{JSON.stringify(item.raw, null, 2)}</pre>
+                      </details>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <p className="helper-text">Run the agent to populate detailed activity.</p>
+              )}
+            </section>
+          )}
 
           {pendingApprovals.length > 0 && (
             <section className="approval-box">
