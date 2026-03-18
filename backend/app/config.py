@@ -28,6 +28,7 @@ class Settings(BaseSettings):
         alias="OTEL_EXPORTER_OTLP_HEADERS",
     )
     otel_service_name: str = Field(default="agent-playground", alias="OTEL_SERVICE_NAME")
+    jaeger_ui_url: str = Field(default="", alias="JAEGER_UI_URL")
     frontend_origin: str = Field(default="http://localhost:5173", alias="FRONTEND_ORIGIN")
 
 

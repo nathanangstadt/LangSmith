@@ -18,8 +18,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  getConfig: () => request<{ langsmith_enabled: boolean; langsmith_project: string; otel_enabled: boolean; otel_endpoint: string; openai_configured: boolean }>("/config"),
+  getConfig: () => request<{ langsmith_enabled: boolean; langsmith_project: string; otel_enabled: boolean; otel_endpoint: string; otel_export_active: boolean; jaeger_ui_url: string; openai_configured: boolean }>("/config"),
+  toggleOtelExport: () => request<{ otel_export_active: boolean }>("/otel/toggle", { method: "POST" }),
   listProfiles: () => request<AgentProfile[]>("/agent-profiles"),
+  cloneProfile: (profileId: string) => request<AgentProfile>(`/agent-profiles/${profileId}/clone`, { method: "POST" }),
   deleteProfile: (profileId: string) => request<{ ok: boolean }>(`/agent-profiles/${profileId}`, { method: "DELETE" }),
   createProfile: (body: Record<string, unknown>) =>
     request<AgentProfile>("/agent-profiles", { method: "POST", body: JSON.stringify(body) }),
@@ -34,6 +36,7 @@ export const api = {
     request<string>(`/agent-profiles/${profileId}/export-agent-md`),
   listServers: () => request<MCPServer[]>("/mcp-servers"),
   getServer: (serverId: string) => request<MCPServerDetail>(`/mcp-servers/${serverId}`),
+  cloneServer: (serverId: string) => request<MCPServer>(`/mcp-servers/${serverId}/clone`, { method: "POST" }),
   deleteServer: (serverId: string) => request<{ ok: boolean }>(`/mcp-servers/${serverId}`, { method: "DELETE" }),
   createServer: (body: Record<string, unknown>) =>
     request<MCPServer>("/mcp-servers", { method: "POST", body: JSON.stringify(body) }),
@@ -47,6 +50,8 @@ export const api = {
   listRuns: (threadId: string) => request<{ id: string; status: string; created_at: string }[]>(`/threads/${threadId}/runs`),
   createThread: (body: Record<string, unknown>) =>
     request<Thread>("/threads", { method: "POST", body: JSON.stringify(body) }),
+  updateThread: (threadId: string, body: { title: string }) =>
+    request<Thread>(`/threads/${threadId}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteThread: (threadId: string) => request<{ ok: boolean }>(`/threads/${threadId}`, { method: "DELETE" }),
   getTelemetry: (runId: string) => request<RunTelemetry>(`/runs/${runId}/telemetry`),
   downloadOtelExport: async (runId: string) => {
@@ -60,10 +65,41 @@ export const api = {
     URL.revokeObjectURL(url);
   },
   resolveApproval: (runId: string, approvalId: string, body: Record<string, unknown>) =>
-    request<{ run: { id: string; status: string }; assistant_message?: Thread["messages"][number] }>(
+    request<{ run: { id: string; status: string } }>(
       `/runs/${runId}/approvals/${approvalId}`,
       { method: "POST", body: JSON.stringify(body) },
     ),
+  async streamResumedRun(
+    runId: string,
+    onEvent: (eventName: string, payload: Record<string, unknown>) => void,
+  ) {
+    const response = await fetch(`${API_BASE_URL}/api/runs/${runId}/resume`, { method: "POST" });
+    if (!response.ok || !response.body) {
+      throw new Error(await response.text());
+    }
+    const decoder = new TextDecoder();
+    const reader = response.body.getReader();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const chunks = buffer.split("\n\n");
+      buffer = chunks.pop() ?? "";
+      for (const chunk of chunks) {
+        const lines = chunk.split("\n");
+        const eventLine = lines.find((line) => line.startsWith("event: "));
+        const dataLine = lines.find((line) => line.startsWith("data: "));
+        if (!eventLine || !dataLine) continue;
+        const eventName = eventLine.slice(7);
+        try {
+          onEvent(eventName, JSON.parse(dataLine.slice(6)));
+        } catch {
+          console.warn("SSE: skipped malformed data line", dataLine);
+        }
+      }
+    }
+  },
   async streamMessage(
     threadId: string,
     content: string,

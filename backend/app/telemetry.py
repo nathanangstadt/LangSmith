@@ -90,19 +90,39 @@ class PostgresSpanExporter(SpanExporter):
         pass
 
 
+class GatedOTLPExporter(SpanExporter):
+    """Wraps OTLPSpanExporter and only forwards spans when active=True."""
+
+    def __init__(self, inner: OTLPSpanExporter) -> None:
+        self._inner = inner
+        self.active: bool = False
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        if not self.active:
+            return SpanExportResult.SUCCESS
+        return self._inner.export(spans)
+
+    def shutdown(self) -> None:
+        self._inner.shutdown()
+
+
 # Always create a TracerProvider. Register the Postgres exporter with a
 # SimpleSpanProcessor (synchronous) so spans land in the DB before the next
 # SSE event is emitted. Add the OTLP BatchSpanProcessor only when an endpoint
-# is configured.
+# is configured — gated so export can be toggled at runtime without restart.
 _resource = Resource.create({"service.name": settings.otel_service_name})
 _provider = TracerProvider(resource=_resource)
 _provider.add_span_processor(SimpleSpanProcessor(PostgresSpanExporter()))
+
+_gated_exporter: GatedOTLPExporter | None = None
 if settings.otel_exporter_otlp_endpoint:
-    _otlp_exporter = OTLPSpanExporter(
-        endpoint=settings.otel_exporter_otlp_endpoint,
-        headers=_parse_headers(settings.otel_exporter_otlp_headers),
+    _gated_exporter = GatedOTLPExporter(
+        OTLPSpanExporter(
+            endpoint=settings.otel_exporter_otlp_endpoint,
+            headers=_parse_headers(settings.otel_exporter_otlp_headers),
+        )
     )
-    _provider.add_span_processor(BatchSpanProcessor(_otlp_exporter))
+    _provider.add_span_processor(BatchSpanProcessor(_gated_exporter))
 trace.set_tracer_provider(_provider)
 
 otel_tracer = trace.get_tracer("agent_playground")
@@ -116,6 +136,15 @@ class ActiveSpan:
 
 
 class TelemetryManager:
+    @property
+    def otel_export_active(self) -> bool:
+        return _gated_exporter.active if _gated_exporter is not None else False
+
+    @otel_export_active.setter
+    def otel_export_active(self, value: bool) -> None:
+        if _gated_exporter is not None:
+            _gated_exporter.active = value
+
     def start_span(
         self,
         run: Any,

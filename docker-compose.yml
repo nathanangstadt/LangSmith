@@ -26,6 +26,7 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-agent-playground}
+      JAEGER_UI_URL: ${JAEGER_UI_URL:-http://localhost:16686}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5174}
     ports:
       - "8001:8000"
@@ -43,6 +44,14 @@ services:
       - "5174:5173"
     depends_on:
       - backend
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4318:4318"     # OTLP/HTTP receiver
 
 volumes:
   pgdata:

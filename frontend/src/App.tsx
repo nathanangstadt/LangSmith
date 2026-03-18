@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { api } from "./api";
 import type { AgentProfile, MCPServer, OtelSpan, PendingApproval, RunTelemetry, Thread } from "./types";
@@ -77,12 +77,16 @@ export default function App() {
   const [activeRunId, setActiveRunId] = useState<string>("");
   const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([]);
   const [waitingThreadId, setWaitingThreadId] = useState<string>("");
+  const [renamingThreadId, setRenamingThreadId] = useState<string>("");
+  const [renamingTitle, setRenamingTitle] = useState<string>("");
   const [statusLine, setStatusLine] = useState("Idle");
   const [errorMessage, setErrorMessage] = useState("");
   const [serverTestState, setServerTestState] = useState<ServerTestState>({ status: "idle", message: "", tools: [] });
   const [liveDetailedActivity, setLiveDetailedActivity] = useState<DetailedActivityItem[]>([]);
   const [traceModalOpen, setTraceModalOpen] = useState(false);
-  const [backendConfig, setBackendConfig] = useState<{ langsmith_enabled: boolean; langsmith_project: string; otel_enabled: boolean; otel_endpoint: string; openai_configured: boolean } | null>(null);
+  const [backendConfig, setBackendConfig] = useState<{ langsmith_enabled: boolean; langsmith_project: string; otel_enabled: boolean; otel_endpoint: string; otel_export_active: boolean; jaeger_ui_url: string; openai_configured: boolean } | null>(null);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     void initializeWorkspace();
@@ -606,6 +610,18 @@ export default function App() {
     }
   };
 
+  const onCloneProfile = async (profileId: string) => {
+    setErrorMessage("");
+    try {
+      const cloned = await api.cloneProfile(profileId);
+      setProfiles((current) => [cloned, ...current]);
+      closeMenu();
+      setStatusLine(`Cloned profile as "${cloned.name}"`);
+    } catch (error) {
+      handleError(error, "Unable to clone profile");
+    }
+  };
+
   const ensureProfile = async (): Promise<string> => {
     let profileId = selectedProfileId || profiles[0]?.id || "";
     if (!profileId) {
@@ -670,6 +686,19 @@ export default function App() {
       await refreshAll();
     } catch (error) {
       handleError(error, "Unable to delete the thread");
+    }
+  };
+
+  const onCommitRename = async (threadId: string) => {
+    const title = renamingTitle.trim();
+    setRenamingThreadId("");
+    setRenamingTitle("");
+    if (!title) return;
+    try {
+      const updated = await api.updateThread(threadId, { title });
+      upsertThread(updated);
+    } catch (error) {
+      handleError(error, "Unable to rename thread");
     }
   };
 
@@ -804,6 +833,18 @@ export default function App() {
     }
   };
 
+  const onCloneServer = async (serverId: string) => {
+    setErrorMessage("");
+    try {
+      const cloned = await api.cloneServer(serverId);
+      setServers((current) => [cloned, ...current]);
+      closeMenu();
+      setStatusLine(`Cloned server as "${cloned.name}"`);
+    } catch (error) {
+      handleError(error, "Unable to clone MCP server");
+    }
+  };
+
   const onTestDraftServer = async () => {
     setErrorMessage("");
     try {
@@ -854,6 +895,8 @@ export default function App() {
       setWaitingThreadId(threadId);
       setStatusLine("Running agent");
       await api.streamMessage(threadId, content, (eventName, payload) => {
+        // NOTE: run.approval.requested closes the stream without run.completed/run.failed,
+        // so waitingThreadId is cleared unconditionally after the stream below.
         const runId = String(payload.run_id ?? "");
         if (runId) setActiveRunId(runId);
         if (eventName === "run.step.started" || eventName === "run.step.completed") {
@@ -928,6 +971,7 @@ export default function App() {
           if (runId) void refreshTelemetry(runId);
         }
       });
+      setWaitingThreadId("");  // always clear — no-op if run.completed/run.failed already cleared it
       const updatedThread = await api.getThread(threadId);
       upsertThread(updatedThread);
       await refreshAll();
@@ -939,19 +983,105 @@ export default function App() {
 
   const onResolveApproval = async (approval: PendingApproval, status: "approved" | "denied") => {
     setErrorMessage("");
+    setPendingApprovals((current) => current.filter((item) => item.approval_id !== approval.approval_id));
+    const threadId = selectedThreadId;
     try {
       const result = await api.resolveApproval(approval.run_id, approval.approval_id, {
         status,
         rationale: status === "approved" ? "Approved in playground UI" : "Denied in playground UI",
       });
-      setPendingApprovals((current) => current.filter((item) => item.approval_id !== approval.approval_id));
       setActiveRunId(result.run.id);
-      setStatusLine(`Approval ${status}`);
-      if (result.assistant_message) {
+      if (result.run.status === "failed") {
+        setStatusLine("Run failed");
+        setErrorMessage("Approval was denied.");
         await refreshAll();
         await refreshTelemetry(result.run.id);
+        return;
       }
+      // Approved — stream the resumed run in real-time.
+      setWaitingThreadId(threadId);
+      setLiveDetailedActivity([]);
+      setStatusLine("Resuming agent after approval…");
+      const runId = result.run.id;
+      await api.streamResumedRun(runId, (eventName, payload) => {
+        if (eventName === "run.step.started" || eventName === "run.step.completed") {
+          setStatusLine(`Run ${String(payload.kind ?? "step")}`);
+          void refreshTelemetry(runId);
+        }
+        if (eventName === "run.detail.input") {
+          const instructions = String(payload.instructions ?? "");
+          const inputItems = Array.isArray(payload.input_items)
+            ? (payload.input_items as Record<string, unknown>[])
+            : [];
+          upsertLiveDetailedItems(buildInputDetailedItems(instructions, inputItems));
+        }
+        if (eventName === "run.detail.item") {
+          const item = payload.item;
+          if (item && typeof item === "object") {
+            upsertLiveDetailedItems(
+              buildOutputDetailedItems(
+                item as Record<string, unknown>,
+                `${String(payload.output_index ?? "item")}`,
+                Number(payload.sequence_number ?? Number.MAX_SAFE_INTEGER),
+              ),
+            );
+          }
+        }
+        if (eventName === "run.detail.text") {
+          const snapshot = String(payload.snapshot ?? "");
+          const itemId = String(payload.item_id ?? `message-${runId}`);
+          if (snapshot) {
+            upsertLiveDetailedItems([{
+              key: itemId,
+              role: "assistant",
+              label: "Assistant",
+              body: snapshot,
+              raw: {
+                type: "message",
+                id: itemId,
+                status: "in_progress",
+                content: [{ type: "output_text", text: snapshot }],
+              },
+              order: Number.MAX_SAFE_INTEGER - 1,
+            }]);
+          }
+        }
+        if (eventName === "run.approval.requested") {
+          setPendingApprovals((current) => [...current, payload as unknown as PendingApproval]);
+          setStatusLine("Waiting for MCP approval");
+          void refreshTelemetry(runId);
+        }
+        if (eventName === "message.delta") {
+          upsertStreamingAssistantMessage(
+            threadId,
+            String(payload.message_id),
+            String(payload.snapshot ?? payload.delta ?? ""),
+          );
+        }
+        if (eventName === "run.completed") {
+          setWaitingThreadId("");
+          setStatusLine("Run completed");
+          const assistantMessage = payload.assistant_message as ThreadMessage | undefined;
+          if (assistantMessage) appendMessageToThread(threadId, assistantMessage);
+          void api.getThread(threadId).then(upsertThread);
+          void refreshTelemetry(runId);
+        }
+        if (eventName === "run.failed") {
+          setWaitingThreadId("");
+          setStatusLine(String(payload.error ?? "Run failed"));
+          setErrorMessage(String(payload.error ?? "Run failed"));
+          const assistantMessage = payload.assistant_message as ThreadMessage | undefined;
+          if (assistantMessage) appendMessageToThread(threadId, assistantMessage);
+          void api.getThread(threadId).then(upsertThread);
+          void refreshTelemetry(runId);
+        }
+      });
+      setWaitingThreadId("");  // always clear after stream ends
+      const updatedThread = await api.getThread(threadId);
+      upsertThread(updatedThread);
+      await refreshAll();
     } catch (error) {
+      setWaitingThreadId("");
       handleError(error, "Unable to resolve the approval");
     }
   };
@@ -1058,11 +1188,16 @@ export default function App() {
         .sort((left, right) => (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER))
     : [];
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [detailedActivity.length, selectedThread?.messages.length]);
+
   return (
     <div className="shell">
       <aside
         className={
-          openMenu && (openMenu.section === "profiles" || openMenu.section === "servers")
+          openMenu && (openMenu.section === "profiles" || openMenu.section === "servers" || openMenu.section === "threads")
             ? "sidebar has-open-menu"
             : "sidebar"
         }
@@ -1104,6 +1239,7 @@ export default function App() {
                       >
                         Edit
                       </button>
+                      <button className="menu-item" onClick={() => void onCloneProfile(profile.id)}>Clone</button>
                       <button className="menu-item danger" onClick={() => void onDeleteProfile(profile.id)}>Delete</button>
                     </div>
                   )}
@@ -1181,6 +1317,67 @@ export default function App() {
           )}
         </section>
 
+        <section className={openMenu?.section === "threads" ? "panel has-open-menu" : "panel"}>
+          <div className="panel-header">
+            <h2>Threads</h2>
+            <button className="icon-button" onClick={onCreateThread} aria-label="Add thread">+</button>
+          </div>
+          <div className="entity-list">
+            {threads.map((thread) => {
+              const isRunning = waitingThreadId === thread.id;
+              const isRenaming = renamingThreadId === thread.id;
+              return (
+                <div key={thread.id} className={[
+                  "entity-row",
+                  thread.id === selectedThreadId ? "selected" : "",
+                  isRunning ? "running" : "",
+                ].filter(Boolean).join(" ")}>
+                  {isRenaming ? (
+                    <input
+                      className="rename-input"
+                      value={renamingTitle}
+                      autoFocus
+                      onChange={(e) => setRenamingTitle(e.target.value)}
+                      onBlur={() => void onCommitRename(thread.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") void onCommitRename(thread.id);
+                        if (e.key === "Escape") { setRenamingThreadId(""); setRenamingTitle(""); }
+                      }}
+                    />
+                  ) : (
+                    <button
+                      className="entity-main"
+                      onClick={() => {
+                        setSelectedThreadId(thread.id);
+                        closeMenu();
+                        setStatusLine(`Selected ${thread.title}`);
+                      }}
+                    >
+                      <strong>{thread.title}{isRunning && <span className="thread-running-dot" aria-label="Running" />}</strong>
+                      <span>{isRunning ? "Running…" : new Date(thread.updated_at).toLocaleString()}</span>
+                    </button>
+                  )}
+                  {!isRenaming && (
+                    <div className="entity-actions">
+                      <button
+                        className="kebab-button secondary-button"
+                        onClick={(e) => { e.stopPropagation(); toggleMenu("threads", thread.id); }}
+                        aria-label={`Thread options for ${thread.title}`}
+                      >⋮</button>
+                      {openMenu?.section === "threads" && openMenu.id === thread.id && (
+                        <div className="menu-popover">
+                          <button className="menu-item" onClick={() => { setRenamingThreadId(thread.id); setRenamingTitle(thread.title); closeMenu(); }}>Rename</button>
+                          <button className="menu-item danger" onClick={() => void onDeleteThread(thread.id)}>Delete</button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
         <section className={openMenu?.section === "servers" ? "panel has-open-menu" : "panel"}>
           <div className="panel-header">
             <h2>MCP Servers</h2>
@@ -1213,6 +1410,7 @@ export default function App() {
                         >
                           Edit
                         </button>
+                        <button className="menu-item" onClick={() => void onCloneServer(server.id)}>Clone</button>
                         <button className="menu-item danger" onClick={() => void onDeleteServer(server.id)}>Delete</button>
                       </div>
                     )}
@@ -1285,57 +1483,13 @@ export default function App() {
       </aside>
 
       <main className="workspace">
-        <section className={openMenu?.section === "threads" ? "chat-pane panel has-open-menu" : "chat-pane panel"}>
+        <section className="chat-pane panel">
           <div className="panel-header">
-            <h2>Threads</h2>
-            <button className="icon-button" onClick={onCreateThread} aria-label="Add thread">+</button>
+            <h2>{selectedThread?.title ?? "No thread selected"}</h2>
           </div>
           <p className="helper-text">
             Profile: <strong>{selectedProfile?.name ?? "Draft profile"}</strong>
-            {" · "}
-            Thread: <strong>{selectedThread?.title ?? "No thread selected"}</strong>
           </p>
-          <div className="entity-list thread-list">
-              {threads.map((thread) => {
-                const isRunning = waitingThreadId === thread.id;
-                return (
-                <div key={thread.id} className={[
-                  "entity-row",
-                  thread.id === selectedThreadId ? "selected" : "",
-                  isRunning ? "running" : "",
-                ].filter(Boolean).join(" ")}>
-                <button
-                  className="entity-main"
-                  onClick={() => {
-                    setSelectedThreadId(thread.id);
-                    closeMenu();
-                    setStatusLine(`Selected ${thread.title}`);
-                  }}
-                >
-                  <strong>{thread.title}{isRunning && <span className="thread-running-dot" aria-label="Running" />}</strong>
-                  <span>{isRunning ? "Running…" : new Date(thread.updated_at).toLocaleString()}</span>
-                </button>
-                <div className="entity-actions">
-                  <button
-                    className="kebab-button secondary-button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      toggleMenu("threads", thread.id);
-                    }}
-                    aria-label={`Thread options for ${thread.title}`}
-                  >
-                    ⋮
-                  </button>
-                  {openMenu?.section === "threads" && openMenu.id === thread.id && (
-                    <div className="menu-popover">
-                      <button className="menu-item danger" onClick={() => void onDeleteThread(thread.id)}>Delete</button>
-                    </div>
-                  )}
-                </div>
-              </div>
-              );
-            })}
-          </div>
 
           <div className="messages">
             {detailedMessagesEnabled
@@ -1355,12 +1509,13 @@ export default function App() {
                     <pre>{message.content}</pre>
                   </article>
                 ))}
-            {waitingThreadId === selectedThreadId && (
+            {waitingThreadId && waitingThreadId === selectedThreadId && (
               <div className="agent-working-indicator">
                 <span className="thread-running-dot" />
                 <span>Agent working…</span>
               </div>
             )}
+            <div ref={messagesEndRef} />
           </div>
 
           {pendingApprovals.length > 0 && (
@@ -1400,12 +1555,42 @@ export default function App() {
                   ? `Exporting to LangSmith project "${backendConfig.langsmith_project}". Set LANGSMITH_TRACING=true and LANGSMITH_API_KEY to configure.`
                   : "LangSmith export is off. Set LANGSMITH_TRACING=true and LANGSMITH_API_KEY in .env to enable."}
               >LangSmith</span>
-              <span
-                className={backendConfig?.otel_enabled ? "badge" : "badge badge--inactive"}
-                title={backendConfig?.otel_enabled
-                  ? `Exporting spans to OTLP endpoint: ${backendConfig.otel_endpoint}`
-                  : "OTEL export is off. Set OTEL_EXPORTER_OTLP_ENDPOINT in .env to enable."}
-              >OTEL</span>
+              <button
+                className={
+                  !backendConfig?.otel_enabled
+                    ? "badge badge--inactive badge--button"
+                    : backendConfig.otel_export_active
+                      ? "badge badge--button badge--otel-on"
+                      : "badge badge--inactive badge--button"
+                }
+                disabled={!backendConfig?.otel_enabled}
+                title={
+                  !backendConfig?.otel_enabled
+                    ? "OTEL export is off. Set OTEL_EXPORTER_OTLP_ENDPOINT in .env to enable."
+                    : backendConfig.otel_export_active
+                      ? `Exporting spans to ${backendConfig.otel_endpoint} — click to stop`
+                      : `OTEL configured (${backendConfig.otel_endpoint}) — click to start exporting`
+                }
+                onClick={() => {
+                  if (!backendConfig?.otel_enabled) return;
+                  api.toggleOtelExport().then((res) => {
+                    setBackendConfig((c) => c ? { ...c, otel_export_active: res.otel_export_active } : c);
+                  }).catch(() => {});
+                }}
+              >
+                OTEL{backendConfig?.otel_enabled && (
+                  <span className={`otel-indicator ${backendConfig.otel_export_active ? "otel-indicator--on" : "otel-indicator--off"}`} />
+                )}
+              </button>
+              {backendConfig?.otel_enabled && backendConfig.jaeger_ui_url && (
+                <a
+                  href={backendConfig.jaeger_ui_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="badge badge--button"
+                  title="Open Jaeger UI"
+                >Jaeger ↗</a>
+              )}
               {telemetry && telemetry.spans.length > 0 && (
                 <button className="secondary-button" onClick={() => setTraceModalOpen(true)}>
                   View Trace
@@ -1468,17 +1653,6 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="timeline">
-                {telemetry.approvals.map((approval) => (
-                  <article key={approval.id} className="timeline-card warning">
-                    <header>
-                      <strong>Approval</strong>
-                      <span>{approval.status}</span>
-                    </header>
-                    <pre>{JSON.stringify(approval.metadata_json, null, 2)}</pre>
-                  </article>
-                ))}
-              </div>
             </>
           ) : (
             <p className="muted">Run a thread to populate telemetry.</p>

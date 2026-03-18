@@ -3,6 +3,8 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse
+from opentelemetry import trace
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -21,6 +23,7 @@ from app.models import (
     Thread,
 )
 from app.runtime import agent_runtime
+from app.telemetry import telemetry_manager
 from app.schemas import (
     AgentMdImportRequest,
     AgentProfileCreate,
@@ -37,6 +40,7 @@ from app.schemas import (
     MessageOut,
     OtelSpanOut,
     ThreadCreate,
+    ThreadUpdate,
     ThreadOut,
 )
 
@@ -94,8 +98,16 @@ def get_config() -> dict[str, bool | str]:
         "langsmith_project": s.langsmith_project,
         "otel_enabled": bool(s.otel_exporter_otlp_endpoint),
         "otel_endpoint": s.otel_exporter_otlp_endpoint or "",
+        "otel_export_active": telemetry_manager.otel_export_active,
+        "jaeger_ui_url": s.jaeger_ui_url,
         "openai_configured": bool(s.openai_api_key),
     }
+
+
+@router.post("/otel/toggle")
+def toggle_otel_export() -> dict[str, bool]:
+    telemetry_manager.otel_export_active = not telemetry_manager.otel_export_active
+    return {"otel_export_active": telemetry_manager.otel_export_active}
 
 
 @router.post("/llm-connections")
@@ -152,6 +164,33 @@ def update_agent_profile(
         raise HTTPException(status_code=409, detail="Agent profile update conflicts with an existing name")
     db.refresh(profile)
     return profile
+
+
+@router.post("/agent-profiles/{profile_id}/clone", response_model=AgentProfileOut)
+def clone_agent_profile(profile_id: str, db: Session = Depends(get_db)) -> AgentProfile:
+    source = db.query(AgentProfile).filter(AgentProfile.id == profile_id).one_or_none()
+    if not source:
+        raise HTTPException(status_code=404, detail="Agent profile not found")
+    clone = AgentProfile(
+        name=f"Copy of {source.name}",
+        role=source.role,
+        guidelines=source.guidelines,
+        output_style=source.output_style,
+        model_name=source.model_name,
+        temperature=source.temperature,
+        max_iterations=source.max_iterations,
+        telemetry_json=dict(source.telemetry_json or {}),
+        ui_json=dict(source.ui_json or {}),
+        llm_connection_id=source.llm_connection_id,
+    )
+    db.add(clone)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A profile with that name already exists")
+    db.refresh(clone)
+    return clone
 
 
 @router.delete("/agent-profiles/{profile_id}")
@@ -286,6 +325,35 @@ def update_mcp_server(server_id: str, payload: MCPServerUpdate, db: Session = De
     return server
 
 
+@router.post("/mcp-servers/{server_id}/clone", response_model=MCPServerOut)
+def clone_mcp_server(server_id: str, db: Session = Depends(get_db)) -> MCPServer:
+    source = db.query(MCPServer).filter(MCPServer.id == server_id).one_or_none()
+    if not source:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    clone = MCPServer(
+        name=f"Copy of {source.name}",
+        server_url=source.server_url,
+        token_url=source.token_url,
+        grant_type=source.grant_type,
+        client_id_encrypted=secret_box.encrypt(secret_box.decrypt(source.client_id_encrypted)),
+        client_secret_encrypted=secret_box.encrypt(secret_box.decrypt(source.client_secret_encrypted)),
+        scope=source.scope,
+        allowed_tools=list(source.allowed_tools or []),
+        approval_mode=source.approval_mode,
+        headers=dict(source.headers or {}),
+        timeout_ms=source.timeout_ms,
+        enabled=source.enabled,
+    )
+    db.add(clone)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="An MCP server with that name already exists")
+    db.refresh(clone)
+    return clone
+
+
 @router.delete("/mcp-servers/{server_id}")
 def delete_mcp_server(server_id: str, db: Session = Depends(get_db)) -> dict[str, bool]:
     server = db.query(MCPServer).filter(MCPServer.id == server_id).one_or_none()
@@ -384,6 +452,18 @@ def get_thread(thread_id: str, db: Session = Depends(get_db)) -> ThreadOut:
     )
 
 
+@router.patch("/threads/{thread_id}", response_model=ThreadOut)
+def update_thread(thread_id: str, payload: ThreadUpdate, db: Session = Depends(get_db)) -> ThreadOut:
+    thread = db.query(Thread).filter(Thread.id == thread_id).one_or_none()
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    thread.title = payload.title.strip() or thread.title
+    db.commit()
+    db.refresh(thread)
+    messages = list(db.query(Message).filter(Message.thread_id == thread.id).order_by(Message.created_at))
+    return ThreadOut(id=thread.id, title=thread.title, agent_profile_id=thread.agent_profile_id, created_at=thread.created_at, updated_at=thread.updated_at, messages=[MessageOut.model_validate(m) for m in messages])
+
+
 @router.delete("/threads/{thread_id}")
 def delete_thread(thread_id: str, db: Session = Depends(get_db)) -> dict[str, bool]:
     thread = db.query(Thread).filter(Thread.id == thread_id).one_or_none()
@@ -441,7 +521,7 @@ async def create_message_and_run(
 
 
 @router.post("/runs/{run_id}/approvals/{approval_id}")
-async def resolve_approval(
+def resolve_approval(
     run_id: str,
     approval_id: str,
     payload: ApprovalResolve,
@@ -463,20 +543,47 @@ async def resolve_approval(
         run.status = "failed"
     db.commit()
     db.refresh(run)
-    assistant_message = None
-    if payload.status == "approved":
-        pending = (
-            db.query(ApprovalDecision)
-            .filter(ApprovalDecision.run_id == run_id, ApprovalDecision.status == "pending")
-            .count()
-        )
-        if pending == 0:
-            assistant_message = await agent_runtime.resume_run(db, run)
-            db.refresh(run)
-    return {
-        "run": {"id": run.id, "status": run.status},
-        "assistant_message": MessageOut.model_validate(assistant_message).model_dump() if assistant_message else None,
-    }
+    return {"run": {"id": run.id, "status": run.status}}
+
+
+@router.post("/runs/{run_id}/resume")
+def resume_run_stream(run_id: str, db: Session = Depends(get_db)) -> StreamingResponse:
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    thread = db.query(Thread).filter(Thread.id == run.thread_id).one()
+    profile = db.query(AgentProfile).filter(AgentProfile.id == run.agent_profile_id).one()
+    user_message = db.query(Message).filter(Message.id == run.user_message_id).one()
+    auto_servers = list(db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "auto"))
+    prompt_servers = list(
+        db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "prompt")
+    )
+    # Reconstruct the original react.run span as a non-recording parent so that
+    # react.resume appears as a child in the same Jaeger trace.
+    parent_otel_span = None
+    original_span = (
+        db.query(OtelSpan)
+        .filter(OtelSpan.run_id == run_id, OtelSpan.name == "react.run")
+        .order_by(OtelSpan.start_time_unix_nano)
+        .first()
+    )
+    if original_span:
+        try:
+            span_ctx = SpanContext(
+                trace_id=int(original_span.trace_id, 16),
+                span_id=int(original_span.span_id, 16),
+                is_remote=True,
+                trace_flags=TraceFlags(TraceFlags.SAMPLED),
+            )
+            parent_otel_span = NonRecordingSpan(span_ctx)
+        except (ValueError, TypeError):
+            pass
+    generator = agent_runtime.stream_run(
+        db, thread, profile, run, user_message, auto_servers, prompt_servers,
+        root_span_name="react.resume",
+        parent_otel_span=parent_otel_span,
+    )
+    return StreamingResponse(generator, media_type="text/event-stream")
 
 
 @router.get("/runs/{run_id}/telemetry")

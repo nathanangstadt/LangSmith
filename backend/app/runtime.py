@@ -297,12 +297,15 @@ class AgentRuntime:
         user_message: Message,
         auto_servers: list[MCPServer],
         prompt_servers: list[MCPServer],
+        root_span_name: str = "react.run",
+        parent_otel_span: Any | None = None,
     ) -> AsyncGenerator[str, None]:
         run = db.merge(run)
         root_span = telemetry_manager.start_span(
             run,
-            name="react.run",
+            name=root_span_name,
             kind="run",
+            parent_otel_span=parent_otel_span,
             attributes={"thread_id": thread.id, "agent_profile_id": profile.id},
         )
         model_span: ActiveSpan | None = None
@@ -351,9 +354,13 @@ class AgentRuntime:
             telemetry_manager.end_span(prepare_span)
             yield self._event("run.step.completed", {"run_id": run.id, "kind": "prepare"})
 
+            # Servers the user approved in our UI must get require_approval="never"
+            # so the OpenAI Responses API does not re-prompt at the tool-call level.
+            approved_server_ids = {a.mcp_server_id for a in approvals if a.status == "approved"}
             tools = []
             for server in [*auto_servers, *prompt_servers]:
-                tool, _ = await build_openai_mcp_tool(server)
+                override = "never" if server.id in approved_server_ids else None
+                tool, _ = await build_openai_mcp_tool(server, require_approval=override)
                 tools.append(tool)
 
             instructions = self._prompt(profile)
@@ -608,7 +615,7 @@ class AgentRuntime:
         prompt_servers = list(
             db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "prompt")
         )
-        async for _ in self.stream_run(db, thread, profile, run, user_message, auto_servers, prompt_servers):
+        async for _ in self.stream_run(db, thread, profile, run, user_message, auto_servers, prompt_servers, root_span_name="react.resume"):
             pass
         if run.assistant_message_id:
             return db.query(Message).filter(Message.id == run.assistant_message_id).one()

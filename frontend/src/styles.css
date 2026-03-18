@@ -127,6 +127,10 @@ pre {
   z-index: 25;
 }
 
+.panel.has-open-menu .entity-list {
+  overflow: visible;
+}
+
 .panel-header,
 .row-actions {
   display: flex;
@@ -418,9 +422,20 @@ button.list-item {
   margin: 0;
 }
 
-.thread-list {
-  max-height: none;
-  overflow: visible;
+.sidebar .entity-list {
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.rename-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid rgba(25, 33, 38, 0.2);
+  border-radius: 6px;
+  padding: 0.25rem 0.45rem;
+  font-size: 0.85rem;
+  background: white;
+  outline: none;
 }
 
 .chat-pane,
@@ -517,6 +532,44 @@ button.list-item {
 .badge--inactive {
   background: #f0f0f0;
   color: #999;
+}
+
+.badge--button {
+  border: none;
+  cursor: pointer;
+  text-decoration: none;
+  gap: 0.35rem;
+  transition: opacity 0.15s;
+}
+
+.badge--button:hover:not(:disabled) {
+  opacity: 0.8;
+}
+
+.badge--button:disabled {
+  cursor: default;
+}
+
+.badge--otel-on {
+  background: #edf3d8;
+  color: #355126;
+}
+
+.otel-indicator {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.otel-indicator--on {
+  background: #3b8e63;
+  animation: pulse-dot 1.8s ease-in-out infinite;
+}
+
+.otel-indicator--off {
+  background: #bbb;
 }
 
 .timeline-kind {

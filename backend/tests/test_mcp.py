@@ -57,3 +57,26 @@ def test_build_openai_mcp_tool_includes_optional_fields_when_present(monkeypatch
         "headers": {"x-tenant": "acme", "Authorization": "Bearer token-123"},
     }
     assert token_meta == {"cache": "hit"}
+
+
+def test_build_openai_mcp_tool_require_approval_override(monkeypatch) -> None:
+    """Passing require_approval="never" must override a prompt-mode server's default
+    of "always". This is used after the user approves the server in the playground UI
+    so the OpenAI Responses API does not re-prompt at the individual tool-call level."""
+    async def fake_fetch_access_token(server: object) -> tuple[str, dict[str, str]]:
+        return "token-xyz", {"cache": "miss"}
+
+    monkeypatch.setattr(mcp, "fetch_access_token", fake_fetch_access_token)
+
+    server = SimpleNamespace(
+        id="server-3",
+        name="invoice_server",
+        server_url="https://mcp.example.com/v1",
+        approval_mode="prompt",   # would normally produce require_approval="always"
+        allowed_tools=[],
+        headers={},
+    )
+
+    tool, _ = asyncio.run(mcp.build_openai_mcp_tool(server, require_approval="never"))
+
+    assert tool["require_approval"] == "never"

@@ -100,6 +100,10 @@ class ThreadCreate(BaseModel):
     title: str = "New Thread"
 
 
+class ThreadUpdate(BaseModel):
+    title: str
+
+
 class MessageCreate(BaseModel):
     content: str
 
