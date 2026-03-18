@@ -18,6 +18,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getConfig: () => request<{ langsmith_enabled: boolean; langsmith_project: string; otel_enabled: boolean; otel_endpoint: string; openai_configured: boolean }>("/config"),
   listProfiles: () => request<AgentProfile[]>("/agent-profiles"),
   deleteProfile: (profileId: string) => request<{ ok: boolean }>(`/agent-profiles/${profileId}`, { method: "DELETE" }),
   createProfile: (body: Record<string, unknown>) =>

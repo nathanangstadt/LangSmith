@@ -484,6 +484,11 @@ button.list-item {
   font-size: 0.85rem;
 }
 
+.badge--inactive {
+  background: #f0f0f0;
+  color: #999;
+}
+
 .timeline-kind {
   display: inline-flex;
   align-items: center;

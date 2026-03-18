@@ -80,9 +80,11 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState("");
   const [serverTestState, setServerTestState] = useState<ServerTestState>({ status: "idle", message: "", tools: [] });
   const [liveDetailedActivity, setLiveDetailedActivity] = useState<DetailedActivityItem[]>([]);
+  const [backendConfig, setBackendConfig] = useState<{ langsmith_enabled: boolean; langsmith_project: string; otel_enabled: boolean; otel_endpoint: string; openai_configured: boolean } | null>(null);
 
   useEffect(() => {
     void initializeWorkspace();
+    api.getConfig().then(setBackendConfig).catch(() => {});
   }, []);
 
   const refreshAll = async () => {
@@ -1217,9 +1219,19 @@ export default function App() {
           <div className="panel-header">
             <h2>Telemetry</h2>
             <div className="row-actions">
-              <span className="badge" title="Stored in this app's local database so you can inspect the run here.">Local</span>
-              <span className="badge" title="LangSmith export target when LangSmith tracing is configured for the runtime.">LangSmith</span>
-              <span className="badge" title="OpenTelemetry or OTLP export target when telemetry export is configured.">OTEL</span>
+              <span className="badge" title="Telemetry is always stored in this app's local Postgres database.">Local</span>
+              <span
+                className={backendConfig?.langsmith_enabled ? "badge" : "badge badge--inactive"}
+                title={backendConfig?.langsmith_enabled
+                  ? `Exporting to LangSmith project "${backendConfig.langsmith_project}". Set LANGSMITH_TRACING=true and LANGSMITH_API_KEY to configure.`
+                  : "LangSmith export is off. Set LANGSMITH_TRACING=true and LANGSMITH_API_KEY in .env to enable."}
+              >LangSmith</span>
+              <span
+                className={backendConfig?.otel_enabled ? "badge" : "badge badge--inactive"}
+                title={backendConfig?.otel_enabled
+                  ? `Exporting spans to OTLP endpoint: ${backendConfig.otel_endpoint}`
+                  : "OTEL export is off. Set OTEL_EXPORTER_OTLP_ENDPOINT in .env to enable."}
+              >OTEL</span>
               {activeRunId && (
                 <button
                   className="secondary-button"

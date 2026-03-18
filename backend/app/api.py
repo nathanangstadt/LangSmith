@@ -87,6 +87,19 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@router.get("/config")
+def get_config() -> dict[str, bool | str]:
+    from app.config import get_settings as _get_settings
+    s = _get_settings()
+    return {
+        "langsmith_enabled": s.langsmith_tracing and bool(s.langsmith_api_key),
+        "langsmith_project": s.langsmith_project,
+        "otel_enabled": bool(s.otel_exporter_otlp_endpoint),
+        "otel_endpoint": s.otel_exporter_otlp_endpoint or "",
+        "openai_configured": bool(s.openai_api_key),
+    }
+
+
 @router.post("/llm-connections")
 def create_llm_connection(payload: LLMConnectionCreate, db: Session = Depends(get_db)) -> dict[str, Any]:
     connection = LLMConnection(**payload.model_dump())
