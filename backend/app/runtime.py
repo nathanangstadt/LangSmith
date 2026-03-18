@@ -8,6 +8,7 @@ from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.database import db_context
 from app.mcp import build_openai_mcp_tool
 from app.models import AgentProfile, AgentRun, ApprovalDecision, MCPServer, Message, Thread
 from app.telemetry import ActiveSpan, telemetry_manager
@@ -232,17 +233,20 @@ class AgentRuntime:
                 if event_type == "response.error":
                     raise RuntimeErrorResponse(str(stream_event.get("error", "OpenAI streaming failed")))
                 if event_type == "response.completed":
-                    response = stream_event.get("response", {})
-                    final_payload = response if isinstance(response, dict) else {}
-                    break  # we have everything we need; don't wait for __done__
+                    final_payload = stream_event.get("response") or {}
+                    # Fix #2: continue draining until __done__ so the producer thread
+                    # finishes before we return and mutate shared state (spans, messages).
+                    continue
                 await on_event(stream_event)
         finally:
-            if task.done():
-                await task  # propagate any exception from the producer
-            else:
-                # Stream context-manager cleanup is still running in the background thread.
-                # Don't block waiting for it — let it finish on its own.
-                task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+            # Fix #2/#3: always cancel the task if it is still running (e.g. on
+            # CancelledError or early exit), then await to suppress any residual exception.
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         if final_payload is None:
             raise RuntimeErrorResponse("OpenAI returned no final response.")
         return final_payload
@@ -290,193 +294,174 @@ class AgentRuntime:
 
     async def stream_run(
         self,
-        db: Session,
-        thread: Thread,
-        profile: AgentProfile,
-        run: AgentRun,
-        user_message: Message,
-        auto_servers: list[MCPServer],
-        prompt_servers: list[MCPServer],
+        run_id: str,
         root_span_name: str = "react.run",
         parent_otel_span: Any | None = None,
     ) -> AsyncGenerator[str, None]:
-        run = db.merge(run)
-        root_span = telemetry_manager.start_span(
-            run,
-            name=root_span_name,
-            kind="run",
-            parent_otel_span=parent_otel_span,
-            attributes={"thread_id": thread.id, "agent_profile_id": profile.id},
-        )
-        model_span: ActiveSpan | None = None
-        model_span_ended = False
-        assistant_message: Message | None = None
-        try:
-            approvals = await self.request_approvals_if_needed(db, run, prompt_servers)
-            if self.approvals_denied(approvals):
-                run.status = "failed"
-                root_span._otel_span.add_event("run.failed", attributes={"error": "An MCP approval was denied."})  # type: ignore[attr-defined]
-                telemetry_manager.end_span(root_span, status="failed")
-                db.commit()
-                yield self._event("run.failed", {"run_id": run.id, "span_id": root_span.span_id, "error": "Approval denied"})
-                return
+        with db_context() as db:
+            run = db.query(AgentRun).filter(AgentRun.id == run_id).one()
+            thread = db.query(Thread).filter(Thread.id == run.thread_id).one()
+            profile = db.query(AgentProfile).filter(AgentProfile.id == run.agent_profile_id).one()
+            auto_servers = list(db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "auto"))
+            prompt_servers = list(db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "prompt"))
+            root_span = telemetry_manager.start_span(
+                run,
+                name=root_span_name,
+                kind="run",
+                parent_otel_span=parent_otel_span,
+                attributes={"thread_id": thread.id, "agent_profile_id": profile.id},
+            )
+            model_span: ActiveSpan | None = None
+            model_span_ended = False
+            assistant_message: Message | None = None
+            try:
+                approvals = await self.request_approvals_if_needed(db, run, prompt_servers)
+                if self.approvals_denied(approvals):
+                    run.status = "failed"
+                    root_span._otel_span.add_event("run.failed", attributes={"error": "An MCP approval was denied."})  # type: ignore[attr-defined]
+                    telemetry_manager.end_span(root_span, status="failed")
+                    db.commit()
+                    yield self._event("run.failed", {"run_id": run.id, "span_id": root_span.span_id, "error": "Approval denied"})
+                    return
 
-            if approvals and not self.approvals_ready(approvals):
-                run.status = "waiting_for_approval"
-                for approval in approvals:
-                    root_span._otel_span.add_event("approval.requested", attributes={  # type: ignore[attr-defined]
-                        "approval_id": approval.id,
-                        "server_name": str(approval.metadata_json.get("server_name", "")),
-                        "server_url": str(approval.metadata_json.get("server_url", "")),
-                    })
-                    yield self._event(
-                        "run.approval.requested",
-                        {
-                            "run_id": run.id,
+                if approvals and not self.approvals_ready(approvals):
+                    run.status = "waiting_for_approval"
+                    for approval in approvals:
+                        root_span._otel_span.add_event("approval.requested", attributes={  # type: ignore[attr-defined]
                             "approval_id": approval.id,
-                            "mcp_server_id": approval.mcp_server_id,
-                            "metadata": approval.metadata_json,
-                        },
+                            "server_name": str(approval.metadata_json.get("server_name", "")),
+                            "server_url": str(approval.metadata_json.get("server_url", "")),
+                        })
+                        yield self._event(
+                            "run.approval.requested",
+                            {
+                                "run_id": run.id,
+                                "approval_id": approval.id,
+                                "mcp_server_id": approval.mcp_server_id,
+                                "metadata": approval.metadata_json,
+                            },
+                        )
+                    telemetry_manager.end_span(root_span, status="waiting_for_approval")
+                    db.commit()
+                    return
+
+                messages = list(db.query(Message).filter(Message.thread_id == thread.id).order_by(Message.created_at))
+
+                prepare_span = telemetry_manager.start_span(
+                    run,
+                    name="prepare.prompt",
+                    kind="prepare",
+                    parent_otel_span=root_span._otel_span,  # type: ignore[attr-defined]
+                    attributes={"message_count": len(messages)},
+                )
+                telemetry_manager.end_span(prepare_span)
+                yield self._event("run.step.completed", {"run_id": run.id, "kind": "prepare"})
+
+                # Servers the user approved in our UI must get require_approval="never"
+                # so the OpenAI Responses API does not re-prompt at the tool-call level.
+                approved_server_ids = {a.mcp_server_id for a in approvals if a.status == "approved"}
+                tools = []
+                for server in [*auto_servers, *prompt_servers]:
+                    override = "never" if server.id in approved_server_ids else None
+                    tool, _ = await build_openai_mcp_tool(server, require_approval=override)
+                    tools.append(tool)
+
+                instructions = self._prompt(profile)
+                input_items = self._conversation_input(messages)
+
+                model_span = telemetry_manager.start_span(
+                    run,
+                    name="model.call",
+                    kind="model",
+                    parent_otel_span=root_span._otel_span,  # type: ignore[attr-defined]
+                    attributes={
+                        "gen_ai.request.model": profile.model_name,
+                        "gen_ai.request.temperature": profile.temperature,
+                        "tool_count": len(tools),
+                    },
+                )
+                model_otel = model_span._otel_span  # type: ignore[attr-defined]
+
+                # Record the full conversation as OTEL span events (gen_ai semantic conventions).
+                model_otel.add_event("gen_ai.system.message", attributes={"gen_ai.prompt": instructions[:8192]})
+                for item in input_items:
+                    role = item.get("role", "user")
+                    model_otel.add_event(
+                        f"gen_ai.{role}.message",
+                        attributes={"gen_ai.prompt": json.dumps(item)[:8192]},
                     )
-                telemetry_manager.end_span(root_span, status="waiting_for_approval")
-                db.commit()
-                return
 
-            messages = list(db.query(Message).filter(Message.thread_id == thread.id).order_by(Message.created_at))
-
-            prepare_span = telemetry_manager.start_span(
-                run,
-                name="prepare.prompt",
-                kind="prepare",
-                parent_otel_span=root_span._otel_span,  # type: ignore[attr-defined]
-                attributes={"message_count": len(messages)},
-            )
-            telemetry_manager.end_span(prepare_span)
-            yield self._event("run.step.completed", {"run_id": run.id, "kind": "prepare"})
-
-            # Servers the user approved in our UI must get require_approval="never"
-            # so the OpenAI Responses API does not re-prompt at the tool-call level.
-            approved_server_ids = {a.mcp_server_id for a in approvals if a.status == "approved"}
-            tools = []
-            for server in [*auto_servers, *prompt_servers]:
-                override = "never" if server.id in approved_server_ids else None
-                tool, _ = await build_openai_mcp_tool(server, require_approval=override)
-                tools.append(tool)
-
-            instructions = self._prompt(profile)
-            input_items = self._conversation_input(messages)
-
-            model_span = telemetry_manager.start_span(
-                run,
-                name="model.call",
-                kind="model",
-                parent_otel_span=root_span._otel_span,  # type: ignore[attr-defined]
-                attributes={
-                    "gen_ai.request.model": profile.model_name,
-                    "gen_ai.request.temperature": profile.temperature,
-                    "tool_count": len(tools),
-                },
-            )
-            model_otel = model_span._otel_span  # type: ignore[attr-defined]
-
-            # Record the full conversation as OTEL span events (gen_ai semantic conventions).
-            model_otel.add_event("gen_ai.system.message", attributes={"gen_ai.prompt": instructions[:8192]})
-            for item in input_items:
-                role = item.get("role", "user")
-                model_otel.add_event(
-                    f"gen_ai.{role}.message",
-                    attributes={"gen_ai.prompt": json.dumps(item)[:8192]},
+                assistant_message = Message(
+                    thread_id=thread.id,
+                    role="assistant",
+                    content="",
+                    metadata_json={"streaming": True},
+                )
+                db.add(assistant_message)
+                db.flush()
+                run.assistant_message_id = assistant_message.id
+                yield self._event("run.step.started", {"run_id": run.id, "kind": "model", "span_id": model_span.span_id})
+                yield self._event(
+                    "run.detail.input",
+                    {
+                        "run_id": run.id,
+                        "kind": "model",
+                        "instructions": instructions,
+                        "input_items": input_items,
+                    },
                 )
 
-            assistant_message = Message(
-                thread_id=thread.id,
-                role="assistant",
-                content="",
-                metadata_json={"streaming": True},
-            )
-            db.add(assistant_message)
-            db.flush()
-            run.assistant_message_id = assistant_message.id
-            yield self._event("run.step.started", {"run_id": run.id, "kind": "model", "span_id": model_span.span_id})
-            yield self._event(
-                "run.detail.input",
-                {
-                    "run_id": run.id,
-                    "kind": "model",
-                    "instructions": instructions,
-                    "input_items": input_items,
-                },
-            )
+                streamed_output_text = ""
+                queued_events: asyncio.Queue[str] = asyncio.Queue()
 
-            streamed_output_text = ""
-            queued_events: asyncio.Queue[str] = asyncio.Queue()
+                async def on_stream_event(stream_event: dict[str, Any]) -> None:
+                    nonlocal streamed_output_text
+                    event_type = str(stream_event.get("type", ""))
 
-            async def on_stream_event(stream_event: dict[str, Any]) -> None:
-                nonlocal streamed_output_text
-                event_type = str(stream_event.get("type", ""))
-
-                # Record completed output items as OTEL span events.
-                if event_type == "response.output_item.done":
-                    item = stream_event.get("item") or {}
-                    item_attrs: dict[str, str] = {
-                        "item.type": str(item.get("type", "")),
-                        "item.id": str(item.get("id", "")),
-                        "content": json.dumps(item)[:65536],
-                    }
-                    # Store text separately so the frontend can recover it even if the
-                    # full JSON is truncated (long invoice / report responses).
-                    if item.get("type") == "message":
-                        content_list = item.get("content", [])
-                        if isinstance(content_list, list):
-                            text = " ".join(
-                                str(c.get("text", ""))
-                                for c in content_list
-                                if isinstance(c, dict) and c.get("type") == "output_text"
+                    # Record completed output items as OTEL span events.
+                    if event_type == "response.output_item.done":
+                        item = stream_event.get("item") or {}
+                        item_attrs: dict[str, str] = {
+                            "item.type": str(item.get("type", "")),
+                            "item.id": str(item.get("id", "")),
+                            "content": json.dumps(item)[:65536],
+                        }
+                        # Store text separately so the frontend can recover it even if the
+                        # full JSON is truncated (long invoice / report responses).
+                        if item.get("type") == "message":
+                            content_list = item.get("content", [])
+                            if isinstance(content_list, list):
+                                text = " ".join(
+                                    str(c.get("text", ""))
+                                    for c in content_list
+                                    if isinstance(c, dict) and c.get("type") == "output_text"
+                                )
+                                if text:
+                                    item_attrs["text"] = text[:65536]
+                        model_otel.add_event("gen_ai.output_item.done", attributes=item_attrs)
+                        await queued_events.put(
+                            self._event(
+                                "run.detail.item",
+                                {"run_id": run.id, "kind": "model", **stream_event},
                             )
-                            if text:
-                                item_attrs["text"] = text[:65536]
-                    model_otel.add_event("gen_ai.output_item.done", attributes=item_attrs)
-                    await queued_events.put(
-                        self._event(
-                            "run.detail.item",
-                            {"run_id": run.id, "kind": "model", **stream_event},
                         )
-                    )
-                    return
+                        return
 
-                if event_type == "response.output_text.delta":
-                    snapshot = str(stream_event.get("snapshot") or "")
-                    delta = str(stream_event.get("delta") or "")
-                    streamed_output_text = snapshot or f"{streamed_output_text}{delta}"
-                    await queued_events.put(
-                        self._event(
-                            "message.delta",
-                            {
-                                "run_id": run.id,
-                                "message_id": assistant_message.id,
-                                "delta": delta,
-                                "snapshot": streamed_output_text,
-                            },
+                    if event_type == "response.output_text.delta":
+                        snapshot = str(stream_event.get("snapshot") or "")
+                        delta = str(stream_event.get("delta") or "")
+                        streamed_output_text = snapshot or f"{streamed_output_text}{delta}"
+                        await queued_events.put(
+                            self._event(
+                                "message.delta",
+                                {
+                                    "run_id": run.id,
+                                    "message_id": assistant_message.id,
+                                    "delta": delta,
+                                    "snapshot": streamed_output_text,
+                                },
+                            )
                         )
-                    )
-                    await queued_events.put(
-                        self._event(
-                            "run.detail.text",
-                            {
-                                "run_id": run.id,
-                                "kind": "model",
-                                "item_id": stream_event.get("item_id"),
-                                "snapshot": streamed_output_text,
-                            },
-                        )
-                    )
-                    return
-
-                if event_type == "response.output_text.done":
-                    text = str(stream_event.get("text") or "")
-                    if text:
-                        streamed_output_text = text
-                    if streamed_output_text:
                         await queued_events.put(
                             self._event(
                                 "run.detail.text",
@@ -488,138 +473,148 @@ class AgentRuntime:
                                 },
                             )
                         )
+                        return
 
-            model_call = asyncio.create_task(
-                self._call_openai_with_mcp_fallback(
-                    model_span=model_span,
-                    model_name=profile.model_name,
-                    instructions=instructions,
-                    temperature=profile.temperature,
-                    input_items=input_items,
-                    tools=tools,
-                    on_event=on_stream_event,
+                    if event_type == "response.output_text.done":
+                        text = str(stream_event.get("text") or "")
+                        if text:
+                            streamed_output_text = text
+                        if streamed_output_text:
+                            await queued_events.put(
+                                self._event(
+                                    "run.detail.text",
+                                    {
+                                        "run_id": run.id,
+                                        "kind": "model",
+                                        "item_id": stream_event.get("item_id"),
+                                        "snapshot": streamed_output_text,
+                                    },
+                                )
+                            )
+
+                model_call = asyncio.create_task(
+                    self._call_openai_with_mcp_fallback(
+                        model_span=model_span,
+                        model_name=profile.model_name,
+                        instructions=instructions,
+                        temperature=profile.temperature,
+                        input_items=input_items,
+                        tools=tools,
+                        on_event=on_stream_event,
+                    )
                 )
-            )
-            while not model_call.done() or not queued_events.empty():
-                if queued_events.empty():
-                    await asyncio.sleep(0.02)
-                    continue
-                yield await queued_events.get()
+                try:
+                    while not model_call.done() or not queued_events.empty():
+                        if queued_events.empty():
+                            await asyncio.sleep(0.02)
+                            continue
+                        yield await queued_events.get()
+                    response, used_mcp_fallback = await model_call
+                finally:
+                    # Fix #3: cancel the background task on client disconnect (GeneratorExit)
+                    # or any other early exit so the OpenAI HTTP connection is not orphaned.
+                    if not model_call.done():
+                        model_call.cancel()
 
-            response, used_mcp_fallback = await model_call
-            output_text = self._response_text_from_payload(response) or streamed_output_text
-            usage_payload = self._response_usage_payload(response)
-            response_id = response.get("id")
+                output_text = self._response_text_from_payload(response) or streamed_output_text
+                usage_payload = self._response_usage_payload(response)
+                response_id = response.get("id")
 
-            # Set token usage as OTEL attributes and record the completion event.
-            if usage_payload.get("input_tokens") is not None:
-                model_otel.set_attribute("gen_ai.usage.input_tokens", int(usage_payload["input_tokens"]))
-            if usage_payload.get("output_tokens") is not None:
-                model_otel.set_attribute("gen_ai.usage.output_tokens", int(usage_payload["output_tokens"]))
-            if usage_payload.get("total_tokens") is not None:
-                model_otel.set_attribute("gen_ai.usage.total_tokens", int(usage_payload["total_tokens"]))
-            if output_text:
-                model_otel.add_event("gen_ai.choice", attributes={
-                    "gen_ai.completion": output_text[:65536],
-                    "finish_reason": "stop",
-                    "used_mcp_fallback": used_mcp_fallback,
-                })
+                # Set token usage as OTEL attributes and record the completion event.
+                if usage_payload.get("input_tokens") is not None:
+                    model_otel.set_attribute("gen_ai.usage.input_tokens", int(usage_payload["input_tokens"]))
+                if usage_payload.get("output_tokens") is not None:
+                    model_otel.set_attribute("gen_ai.usage.output_tokens", int(usage_payload["output_tokens"]))
+                if usage_payload.get("total_tokens") is not None:
+                    model_otel.set_attribute("gen_ai.usage.total_tokens", int(usage_payload["total_tokens"]))
+                if output_text:
+                    model_otel.add_event("gen_ai.choice", attributes={
+                        "gen_ai.completion": output_text[:65536],
+                        "finish_reason": "stop",
+                        "used_mcp_fallback": used_mcp_fallback,
+                    })
 
-            model_span_ended = True
-            telemetry_manager.end_span(model_span)
-            yield self._event("run.step.completed", {"run_id": run.id, "kind": "model", "span_id": model_span.span_id, "usage": usage_payload})
+                model_span_ended = True
+                telemetry_manager.end_span(model_span)
+                yield self._event("run.step.completed", {"run_id": run.id, "kind": "model", "span_id": model_span.span_id, "usage": usage_payload})
 
-            assistant_message.content = output_text or "(empty response)"
-            assistant_message.metadata_json = {"response_id": response_id}
-            run.status = "completed"
+                assistant_message.content = output_text or "(empty response)"
+                assistant_message.metadata_json = {"response_id": response_id}
+                run.status = "completed"
 
-            final_span = telemetry_manager.start_span(
-                run,
-                name="final.answer",
-                kind="final",
-                parent_otel_span=root_span._otel_span,  # type: ignore[attr-defined]
-            )
-            telemetry_manager.end_span(final_span)
-            telemetry_manager.end_span(root_span)
-            db.commit()
+                final_span = telemetry_manager.start_span(
+                    run,
+                    name="final.answer",
+                    kind="final",
+                    parent_otel_span=root_span._otel_span,  # type: ignore[attr-defined]
+                )
+                telemetry_manager.end_span(final_span)
+                telemetry_manager.end_span(root_span)
+                db.commit()
 
-            if not streamed_output_text and assistant_message.content:
+                if not streamed_output_text and assistant_message.content:
+                    yield self._event(
+                        "message.delta",
+                        {
+                            "run_id": run.id,
+                            "message_id": assistant_message.id,
+                            "delta": assistant_message.content,
+                            "snapshot": assistant_message.content,
+                        },
+                    )
                 yield self._event(
-                    "message.delta",
+                    "run.completed",
                     {
                         "run_id": run.id,
-                        "message_id": assistant_message.id,
-                        "delta": assistant_message.content,
-                        "snapshot": assistant_message.content,
+                        "span_id": final_span.span_id,
+                        "assistant_message": {
+                            "id": assistant_message.id,
+                            "thread_id": assistant_message.thread_id,
+                            "role": assistant_message.role,
+                            "content": assistant_message.content,
+                            "metadata_json": assistant_message.metadata_json,
+                        },
                     },
                 )
-            yield self._event(
-                "run.completed",
-                {
-                    "run_id": run.id,
-                    "span_id": final_span.span_id,
-                    "assistant_message": {
-                        "id": assistant_message.id,
-                        "thread_id": assistant_message.thread_id,
-                        "role": assistant_message.role,
-                        "content": assistant_message.content,
-                        "metadata_json": assistant_message.metadata_json,
-                    },
-                },
-            )
-        except Exception as exc:
-            error_message = str(exc)
-            run.status = "failed"
-            failed_span = (model_span if model_span and not model_span_ended else None) or root_span
-            failed_otel = getattr(failed_span, "_otel_span", None)
-            if failed_otel:
-                failed_otel.add_event("run.failed", attributes={"error": error_message, "error_type": exc.__class__.__name__})
-            telemetry_manager.end_span(failed_span, status="failed")
-            if failed_span is not root_span:
-                telemetry_manager.close_otel_span(root_span, status="failed")
+            except Exception as exc:
+                error_message = str(exc)
+                run.status = "failed"
+                failed_span = (model_span if model_span and not model_span_ended else None) or root_span
+                failed_otel = getattr(failed_span, "_otel_span", None)
+                if failed_otel:
+                    failed_otel.add_event("run.failed", attributes={"error": error_message, "error_type": exc.__class__.__name__})
+                telemetry_manager.end_span(failed_span, status="failed")
+                if failed_span is not root_span:
+                    telemetry_manager.close_otel_span(root_span, status="failed")
 
-            if assistant_message is None:
-                assistant_message = Message(
-                    thread_id=thread.id,
-                    role="assistant",
-                    content=f"Runtime error: {error_message}",
-                    metadata_json={"error": True},
+                if assistant_message is None:
+                    assistant_message = Message(
+                        thread_id=thread.id,
+                        role="assistant",
+                        content=f"Runtime error: {error_message}",
+                        metadata_json={"error": True},
+                    )
+                    db.add(assistant_message)
+                    db.flush()
+                else:
+                    assistant_message.content = f"Runtime error: {error_message}"
+                    assistant_message.metadata_json = {"error": True}
+                run.assistant_message_id = assistant_message.id
+                db.commit()
+                yield self._event(
+                    "run.failed",
+                    {
+                        "run_id": run.id,
+                        "span_id": failed_span.span_id,
+                        "error": error_message,
+                        "assistant_message": {
+                            "id": assistant_message.id,
+                            "thread_id": assistant_message.thread_id,
+                            "role": assistant_message.role,
+                            "content": assistant_message.content,
+                        },
+                    },
                 )
-                db.add(assistant_message)
-                db.flush()
-            else:
-                assistant_message.content = f"Runtime error: {error_message}"
-                assistant_message.metadata_json = {"error": True}
-            run.assistant_message_id = assistant_message.id
-            db.commit()
-            yield self._event(
-                "run.failed",
-                {
-                    "run_id": run.id,
-                    "span_id": failed_span.span_id,
-                    "error": error_message,
-                    "assistant_message": {
-                        "id": assistant_message.id,
-                        "thread_id": assistant_message.thread_id,
-                        "role": assistant_message.role,
-                        "content": assistant_message.content,
-                    },
-                },
-            )
-
-    async def resume_run(self, db: Session, run: AgentRun) -> Message | None:
-        thread = db.query(Thread).filter(Thread.id == run.thread_id).one()
-        profile = db.query(AgentProfile).filter(AgentProfile.id == run.agent_profile_id).one()
-        user_message = db.query(Message).filter(Message.id == run.user_message_id).one()
-        auto_servers = list(db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "auto"))
-        prompt_servers = list(
-            db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "prompt")
-        )
-        async for _ in self.stream_run(db, thread, profile, run, user_message, auto_servers, prompt_servers, root_span_name="react.resume"):
-            pass
-        if run.assistant_message_id:
-            return db.query(Message).filter(Message.id == run.assistant_message_id).one()
-        return None
 
     @staticmethod
     def _event(name: str, payload: dict[str, Any]) -> str:

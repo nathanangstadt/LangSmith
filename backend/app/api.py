@@ -3,7 +3,6 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from opentelemetry import trace
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
@@ -511,13 +510,7 @@ async def create_message_and_run(
     )
     db.add(run)
     db.commit()
-    db.refresh(run)
-    auto_servers = list(db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "auto"))
-    prompt_servers = list(
-        db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "prompt")
-    )
-    generator = agent_runtime.stream_run(db, thread, profile, run, user_message, auto_servers, prompt_servers)
-    return StreamingResponse(generator, media_type="text/event-stream")
+    return StreamingResponse(agent_runtime.stream_run(run.id), media_type="text/event-stream")
 
 
 @router.post("/runs/{run_id}/approvals/{approval_id}")
@@ -537,6 +530,10 @@ def resolve_approval(
     )
     if not approval:
         raise HTTPException(status_code=404, detail="Approval not found")
+    if approval.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Approval already resolved (status: {approval.status})")
+    if run.status != "waiting_for_approval":
+        raise HTTPException(status_code=409, detail=f"Run is not waiting for approval (status: {run.status})")
     approval.status = payload.status
     approval.rationale = payload.rationale
     if payload.status == "denied":
@@ -548,16 +545,11 @@ def resolve_approval(
 
 @router.post("/runs/{run_id}/resume")
 def resume_run_stream(run_id: str, db: Session = Depends(get_db)) -> StreamingResponse:
+    # Verify the run exists before handing off to the streaming generator.
     run = db.query(AgentRun).filter(AgentRun.id == run_id).one_or_none()
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    thread = db.query(Thread).filter(Thread.id == run.thread_id).one()
-    profile = db.query(AgentProfile).filter(AgentProfile.id == run.agent_profile_id).one()
-    user_message = db.query(Message).filter(Message.id == run.user_message_id).one()
-    auto_servers = list(db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "auto"))
-    prompt_servers = list(
-        db.query(MCPServer).filter(MCPServer.enabled.is_(True), MCPServer.approval_mode == "prompt")
-    )
+
     # Reconstruct the original react.run span as a non-recording parent so that
     # react.resume appears as a child in the same Jaeger trace.
     parent_otel_span = None
@@ -578,12 +570,11 @@ def resume_run_stream(run_id: str, db: Session = Depends(get_db)) -> StreamingRe
             parent_otel_span = NonRecordingSpan(span_ctx)
         except (ValueError, TypeError):
             pass
-    generator = agent_runtime.stream_run(
-        db, thread, profile, run, user_message, auto_servers, prompt_servers,
-        root_span_name="react.resume",
-        parent_otel_span=parent_otel_span,
+
+    return StreamingResponse(
+        agent_runtime.stream_run(run_id, root_span_name="react.resume", parent_otel_span=parent_otel_span),
+        media_type="text/event-stream",
     )
-    return StreamingResponse(generator, media_type="text/event-stream")
 
 
 @router.get("/runs/{run_id}/telemetry")

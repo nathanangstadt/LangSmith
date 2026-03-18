@@ -7,6 +7,7 @@ Run inside Docker:
 
 import asyncio
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -70,13 +71,20 @@ def fx(db):
     db.add(prompt_server)
     db.flush()
 
-    return SimpleNamespace(
-        profile=profile,
-        thread=thread,
-        user_msg=user_msg,
-        run=run,
-        prompt_server=prompt_server,
-    )
+    # Patch db_context so stream_run uses the in-memory test session instead of
+    # opening a new connection to the production database.
+    @contextmanager
+    def _fake_db_context():
+        yield db
+
+    with patch("app.runtime.db_context", _fake_db_context):
+        yield SimpleNamespace(
+            profile=profile,
+            thread=thread,
+            user_msg=user_msg,
+            run=run,
+            prompt_server=prompt_server,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +182,7 @@ def test_prompt_server_emits_approval_requested(mock_tm, fx, db):
     mock_tm.start_span.side_effect = stub_start_span
 
     runtime = AgentRuntime.__new__(AgentRuntime)
-    events = collect_sse(
-        runtime.stream_run(db, fx.thread, fx.profile, fx.run, fx.user_msg,
-                           auto_servers=[], prompt_servers=[fx.prompt_server])
-    )
+    events = collect_sse(runtime.stream_run(fx.run.id))
 
     names = [e[0] for e in events]
     assert "run.approval.requested" in names
@@ -202,10 +207,7 @@ def test_approval_creation_is_idempotent(mock_tm, fx, db):
 
     runtime = AgentRuntime.__new__(AgentRuntime)
     for _ in range(2):
-        collect_sse(
-            runtime.stream_run(db, fx.thread, fx.profile, fx.run, fx.user_msg,
-                               auto_servers=[], prompt_servers=[fx.prompt_server])
-        )
+        collect_sse(runtime.stream_run(fx.run.id))
 
     count = db.query(ApprovalDecision).filter_by(run_id=fx.run.id).count()
     assert count == 1
@@ -226,10 +228,7 @@ def test_denied_approval_emits_run_failed(mock_tm, fx, db):
     db.flush()
 
     runtime = AgentRuntime.__new__(AgentRuntime)
-    events = collect_sse(
-        runtime.stream_run(db, fx.thread, fx.profile, fx.run, fx.user_msg,
-                           auto_servers=[], prompt_servers=[fx.prompt_server])
-    )
+    events = collect_sse(runtime.stream_run(fx.run.id))
 
     names = [e[0] for e in events]
     assert "run.failed" in names
@@ -260,10 +259,7 @@ def test_approved_approval_bypasses_gate(mock_tm, _mock_tool, fx, db):
         raise RuntimeError("SENTINEL: reached OpenAI call")
 
     with patch.object(runtime, "_call_openai_with_mcp_fallback", side_effect=raise_after_gate):
-        events = collect_sse(
-            runtime.stream_run(db, fx.thread, fx.profile, fx.run, fx.user_msg,
-                               auto_servers=[], prompt_servers=[fx.prompt_server])
-        )
+        events = collect_sse(runtime.stream_run(fx.run.id))
 
     names = [e[0] for e in events]
     # Gate bypassed — approval event must NOT be re-emitted.
@@ -280,16 +276,17 @@ def test_auto_server_skips_approval_gate(mock_tm, _mock_tool, fx, db):
     """An auto-mode server must not trigger any approval logic."""
     mock_tm.start_span.side_effect = stub_start_span
 
+    # Change the server to auto mode so stream_run finds it in auto_servers.
+    fx.prompt_server.approval_mode = "auto"
+    db.flush()
+
     runtime = AgentRuntime.__new__(AgentRuntime)
 
     async def raise_sentinel(*args, **kwargs):
         raise RuntimeError("SENTINEL: reached OpenAI call")
 
     with patch.object(runtime, "_call_openai_with_mcp_fallback", side_effect=raise_sentinel):
-        events = collect_sse(
-            runtime.stream_run(db, fx.thread, fx.profile, fx.run, fx.user_msg,
-                               auto_servers=[fx.prompt_server], prompt_servers=[])
-        )
+        events = collect_sse(runtime.stream_run(fx.run.id))
 
     names = [e[0] for e in events]
     assert "run.approval.requested" not in names
@@ -297,7 +294,8 @@ def test_auto_server_skips_approval_gate(mock_tm, _mock_tool, fx, db):
 
 
 # ---------------------------------------------------------------------------
-# Integration test: resume_run uses react.resume span name
+# Integration tests: approved server uses require_approval="never" and
+# the resume path uses the react.resume span name
 # ---------------------------------------------------------------------------
 
 @patch("app.runtime.build_openai_mcp_tool", new_callable=AsyncMock, return_value=FAKE_MCP_TOOL)
@@ -322,10 +320,7 @@ def test_approved_server_built_with_require_approval_never(mock_tm, mock_tool, f
         raise RuntimeError("SENTINEL")
 
     with patch.object(runtime, "_call_openai_with_mcp_fallback", side_effect=raise_sentinel):
-        collect_sse(
-            runtime.stream_run(db, fx.thread, fx.profile, fx.run, fx.user_msg,
-                               auto_servers=[], prompt_servers=[fx.prompt_server])
-        )
+        collect_sse(runtime.stream_run(fx.run.id))
 
     mock_tool.assert_called_once()
     _, kwargs = mock_tool.call_args
@@ -337,12 +332,11 @@ def test_approved_server_built_with_require_approval_never(mock_tm, mock_tool, f
 
 @patch("app.runtime.build_openai_mcp_tool", new_callable=AsyncMock, return_value=FAKE_MCP_TOOL)
 @patch("app.runtime.telemetry_manager")
-def test_resume_run_uses_react_resume_span(mock_tm, _mock_tool, fx, db):
-    """resume_run must call stream_run with root_span_name='react.resume' so
-    the telemetry does not show a second 'react.run' root span."""
+def test_resume_uses_react_resume_span(mock_tm, _mock_tool, fx, db):
+    """stream_run called with root_span_name='react.resume' must use that name
+    for the root span, so the telemetry does not show a second 'react.run' node."""
     mock_tm.start_span.side_effect = stub_start_span
 
-    # Pre-approve so resume_run can get past the approval gate.
     db.add(ApprovalDecision(
         run_id=fx.run.id,
         mcp_server_id=fx.prompt_server.id,
@@ -353,21 +347,15 @@ def test_resume_run_uses_react_resume_span(mock_tm, _mock_tool, fx, db):
 
     runtime = AgentRuntime.__new__(AgentRuntime)
 
-    # Re-hydrate the server list that resume_run queries from DB.
-    fx.prompt_server.enabled = True
-    db.flush()
-
     async def raise_sentinel(*args, **kwargs):
         raise RuntimeError("SENTINEL")
 
     with patch.object(runtime, "_call_openai_with_mcp_fallback", side_effect=raise_sentinel):
-        asyncio.run(runtime.resume_run(db, fx.run))
+        collect_sse(runtime.stream_run(fx.run.id, root_span_name="react.resume"))
 
     # First start_span call is the root span.
     first_call = mock_tm.start_span.call_args_list[0]
-    # Works for both positional and keyword invocations.
     span_name = first_call.kwargs.get("name") or first_call.args[1]
     assert span_name == "react.resume", (
-        f"Expected root span name 'react.resume', got '{span_name}'. "
-        "resume_run must pass root_span_name='react.resume' to stream_run."
+        f"Expected root span name 'react.resume', got '{span_name}'."
     )
