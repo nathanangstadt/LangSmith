@@ -61,10 +61,12 @@ async def build_openai_mcp_tool(server: MCPServer) -> tuple[dict[str, Any], dict
         "server_label": server.name,
         "server_url": server.server_url,
         "authorization": f"Bearer {token}",
-        "allowed_tools": server.allowed_tools,
         "require_approval": "always" if server.approval_mode == "prompt" else "never",
-        "headers": server.headers or {},
     }
+    if server.allowed_tools:
+        tool["allowed_tools"] = server.allowed_tools
+    if server.headers:
+        tool["headers"] = server.headers
     return tool, token_meta
 
 
