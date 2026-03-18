@@ -188,6 +188,16 @@ export default function App() {
     }
   }, [servers, selectedServerId, isCreatingServer]);
 
+  useEffect(() => {
+    if (!selectedThreadId || !selectedThread) {
+      setLiveDetailedActivity([]);
+      return;
+    }
+    if (waitingThreadId && waitingThreadId !== selectedThreadId) {
+      setLiveDetailedActivity([]);
+    }
+  }, [selectedThreadId, selectedThread, waitingThreadId]);
+
   const handleError = (error: unknown, fallback: string) => {
     const rawMessage = error instanceof Error ? error.message : fallback;
     let message = rawMessage || fallback;
@@ -518,6 +528,7 @@ export default function App() {
         setPendingApprovals([]);
         setActiveRunId("");
         setTelemetry(null);
+        setWaitingThreadId("");
       }
       closeMenu();
       setStatusLine("Deleted thread");
@@ -823,8 +834,11 @@ export default function App() {
         })
       : [];
 
-  const detailedActivity: DetailedActivityItem[] = detailedMessagesEnabled
-    ? Array.from(new Map([...liveDetailedActivity, ...persistedDetailedActivity].map((item) => [item.key, item])).values())
+  const visibleLiveDetailedActivity =
+    selectedThreadId && waitingThreadId === selectedThreadId ? liveDetailedActivity : [];
+
+  const detailedActivity: DetailedActivityItem[] = detailedMessagesEnabled && selectedThread
+    ? Array.from(new Map([...visibleLiveDetailedActivity, ...persistedDetailedActivity].map((item) => [item.key, item])).values())
         .sort((left, right) => (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER))
     : [];
 
