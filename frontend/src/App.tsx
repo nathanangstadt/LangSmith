@@ -137,7 +137,7 @@ export default function App() {
   const selectedThread = threads.find((thread) => thread.id === selectedThreadId);
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId);
   const selectedServer = servers.find((server) => server.id === selectedServerId);
-  const temperatureDisabled = profileForm.model_name.startsWith("gpt-5");
+  const temperatureDisabled = profileForm.model_name.startsWith("gpt-5") || profileForm.model_name.startsWith("o");
   const formatStepName = (value: string) =>
     value
       .split(".")
@@ -940,9 +940,25 @@ export default function App() {
           <textarea value={profileForm.output_style} onChange={(e) => onProfileField("output_style", e.target.value)} rows={3} />
           <label>Model</label>
           <select value={profileForm.model_name} onChange={(e) => onProfileField("model_name", e.target.value)}>
-            <option value="gpt-5-mini">gpt-5-mini</option>
-            <option value="gpt-5-chat-latest">gpt-5-chat-latest</option>
-            <option value="gpt-5.4">gpt-5.4</option>
+            <optgroup label="GPT-4o">
+              <option value="gpt-4o-mini">gpt-4o-mini (cheap)</option>
+              <option value="gpt-4o">gpt-4o</option>
+            </optgroup>
+            <optgroup label="GPT-4.1">
+              <option value="gpt-4.1-mini">gpt-4.1-mini (cheap)</option>
+              <option value="gpt-4.1-nano">gpt-4.1-nano (cheapest)</option>
+              <option value="gpt-4.1">gpt-4.1</option>
+            </optgroup>
+            <optgroup label="GPT-5 (MCP native)">
+              <option value="gpt-5-mini">gpt-5-mini</option>
+              <option value="gpt-5-chat-latest">gpt-5-chat-latest</option>
+              <option value="gpt-5.4">gpt-5.4</option>
+            </optgroup>
+            <optgroup label="Reasoning (o-series)">
+              <option value="o4-mini">o4-mini (cheap)</option>
+              <option value="o3-mini">o3-mini (cheap)</option>
+              <option value="o3">o3</option>
+            </optgroup>
           </select>
           <label>Temperature</label>
           <input

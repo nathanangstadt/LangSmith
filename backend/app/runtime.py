@@ -171,7 +171,7 @@ class AgentRuntime:
 
     @staticmethod
     def _supports_temperature(model_name: str) -> bool:
-        return not model_name.startswith("gpt-5")
+        return not (model_name.startswith("gpt-5") or model_name.startswith("o"))
 
     @traceable(run_type="chain", name="agent_playground.react_run")
     async def _call_openai_streaming(
@@ -466,7 +466,21 @@ class AgentRuntime:
                     )
                     return
                 if event_type == "response.output_text.done":
-                    streamed_output_text = str(stream_event.get("text") or streamed_output_text)
+                    text = str(stream_event.get("text") or "")
+                    if text:
+                        streamed_output_text = text
+                    if streamed_output_text:
+                        await queued_events.put(
+                            self._event(
+                                "run.detail.text",
+                                {
+                                    "run_id": run.id,
+                                    "kind": "model",
+                                    "item_id": stream_event.get("item_id"),
+                                    "snapshot": streamed_output_text,
+                                },
+                            )
+                        )
 
             model_call = asyncio.create_task(
                 self._call_openai_with_mcp_fallback(
