@@ -307,6 +307,7 @@ class AgentRuntime:
             input_payload={"message_id": user_message.id, "content": user_message.content},
         )
         model_span: CanonicalSpan | None = None
+        model_span_ended = False
         assistant_message: Message | None = None
         try:
             approvals = await self.request_approvals_if_needed(db, run, prompt_servers)
@@ -495,6 +496,7 @@ class AgentRuntime:
             response_output_items = response.get("output", [])
             if not isinstance(response_output_items, list):
                 response_output_items = []
+            model_span_ended = True
             model_step = telemetry_manager.end_span(
                 db,
                 run,
@@ -567,7 +569,7 @@ class AgentRuntime:
         except Exception as exc:
             error_message = str(exc)
             run.status = "failed"
-            failed_span = model_span or root_span
+            failed_span = (model_span if model_span and not model_span_ended else None) or root_span
             step = telemetry_manager.end_span(
                 db,
                 run,

@@ -30,7 +30,7 @@ export const api = {
       body: JSON.stringify({ content }),
     }),
   exportAgentMd: (profileId: string) =>
-    request<string>(`/agent-profiles/${profileId}/export-agent-md`, { headers: {} }),
+    request<string>(`/agent-profiles/${profileId}/export-agent-md`),
   listServers: () => request<MCPServer[]>("/mcp-servers"),
   getServer: (serverId: string) => request<MCPServerDetail>(`/mcp-servers/${serverId}`),
   deleteServer: (serverId: string) => request<{ ok: boolean }>(`/mcp-servers/${serverId}`, { method: "DELETE" }),
@@ -81,7 +81,11 @@ export const api = {
         const dataLine = lines.find((line) => line.startsWith("data: "));
         if (!eventLine || !dataLine) continue;
         const eventName = eventLine.slice(7);
-        onEvent(eventName, JSON.parse(dataLine.slice(6)));
+        try {
+          onEvent(eventName, JSON.parse(dataLine.slice(6)));
+        } catch {
+          console.warn("SSE: skipped malformed data line", dataLine);
+        }
       }
     }
   },

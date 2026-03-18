@@ -581,6 +581,14 @@ export default function App() {
     enabled: server.enabled,
   });
 
+  const parseHeadersField = (raw: string): Record<string, string> => {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      throw new Error('Headers must be valid JSON (e.g. {"X-Custom": "value"} or {})');
+    }
+  };
+
   const serializeDraftServer = (form: MpcFormState) => ({
     server_id: selectedServerId || undefined,
     ...form,
@@ -588,7 +596,7 @@ export default function App() {
       .split(",")
       .map((tool) => tool.trim())
       .filter(Boolean),
-    headers: JSON.parse(form.headers),
+    headers: parseHeadersField(form.headers),
   });
 
   const buildServerTestMessage = (result: Record<string, unknown>, label: string) => {

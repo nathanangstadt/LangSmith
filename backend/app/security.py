@@ -1,13 +1,20 @@
 import base64
 import hashlib
+import logging
 
 from cryptography.fernet import Fernet
 
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
+
 
 def _derive_key(raw_key: str) -> bytes:
     if not raw_key:
+        logger.warning(
+            "APP_ENCRYPTION_KEY is not set. Using a hardcoded insecure key — "
+            "MCP credentials are NOT protected. Set APP_ENCRYPTION_KEY before storing any secrets."
+        )
         raw_key = "local-dev-insecure-key"
     if len(raw_key) == 44 and raw_key.endswith("="):
         try:

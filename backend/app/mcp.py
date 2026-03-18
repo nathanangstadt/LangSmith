@@ -10,6 +10,11 @@ from app.security import secret_box
 
 
 class MCPTokenCache:
+    """In-process token cache. Safe for single-worker deployments only.
+    Under multi-worker deployments each worker maintains its own cache,
+    multiplying OAuth token requests. Move to a shared store (e.g. Redis)
+    before running with multiple Uvicorn/Gunicorn workers."""
+
     def __init__(self) -> None:
         self._cache: dict[str, dict[str, Any]] = {}
 

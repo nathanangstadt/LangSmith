@@ -288,14 +288,6 @@ def delete_mcp_server(server_id: str, db: Session = Depends(get_db)) -> dict[str
     return {"ok": True}
 
 
-@router.post("/mcp-servers/{server_id}/test")
-async def test_mcp_server(server_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
-    server = db.query(MCPServer).filter(MCPServer.id == server_id).one_or_none()
-    if not server:
-        raise HTTPException(status_code=404, detail="MCP server not found")
-    return await _test_server_config(server)
-
-
 @router.post("/mcp-servers/test")
 async def test_mcp_server_draft(payload: MCPServerTestRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     existing_server: MCPServer | None = None
@@ -329,6 +321,14 @@ async def test_mcp_server_draft(payload: MCPServerTestRequest, db: Session = Dep
         timeout_ms=payload.timeout_ms,
         enabled=payload.enabled,
     )
+    return await _test_server_config(server)
+
+
+@router.post("/mcp-servers/{server_id}/test")
+async def test_mcp_server(server_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    server = db.query(MCPServer).filter(MCPServer.id == server_id).one_or_none()
+    if not server:
+        raise HTTPException(status_code=404, detail="MCP server not found")
     return await _test_server_config(server)
 
 
