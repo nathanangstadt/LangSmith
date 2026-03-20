@@ -1,8 +1,11 @@
 import asyncio
 import json
+import logging
+import re
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
 
 from openai import OpenAI
 from sqlalchemy.orm import Session
@@ -15,6 +18,7 @@ from app.telemetry import ActiveSpan, telemetry_manager
 
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 class RuntimeErrorResponse(Exception):
@@ -144,9 +148,9 @@ class AgentRuntime:
 
     @staticmethod
     def _response_text_from_payload(payload: dict[str, Any]) -> str:
-        direct_text = payload.get("output_text")
-        if isinstance(direct_text, str) and direct_text:
-            return direct_text
+        # Always parse the full output list — do not short-circuit on the SDK's
+        # `output_text` convenience field, which only contains text from the
+        # first message item and omits text produced after tool calls.
         output = payload.get("output", [])
         if not isinstance(output, list):
             return ""
@@ -209,6 +213,8 @@ class AgentRuntime:
             try:
                 with self.client.responses.stream(**kwargs) as stream:
                     for event in stream:
+                        if settings.log_llm_traffic:
+                            logger.debug("[LLM RAW] type=%s payload=%s", getattr(event, "type", "?"), repr(event)[:2048])
                         payload = self._serialize_stream_event(event)
                         if payload is not None:
                             loop.call_soon_threadsafe(queue.put_nowait, payload)
@@ -295,7 +301,7 @@ class AgentRuntime:
     async def stream_run(
         self,
         run_id: str,
-        root_span_name: str = "react.run",
+        root_span_name: str = "gen_ai.agent.invoke",
         parent_otel_span: Any | None = None,
     ) -> AsyncGenerator[str, None]:
         with db_context() as db:
@@ -309,7 +315,13 @@ class AgentRuntime:
                 name=root_span_name,
                 kind="run",
                 parent_otel_span=parent_otel_span,
-                attributes={"thread_id": thread.id, "agent_profile_id": profile.id},
+                attributes={
+                    "thread_id": thread.id,
+                    "agent_profile_id": profile.id,
+                    "gen_ai.agent.name": profile.name,
+                    "gen_ai.thread.id": thread.id,
+                    "gen_ai.run.id": run.id,
+                },
             )
             model_span: ActiveSpan | None = None
             model_span_ended = False
@@ -347,6 +359,10 @@ class AgentRuntime:
 
                 messages = list(db.query(Message).filter(Message.thread_id == thread.id).order_by(Message.created_at))
 
+                user_input = next((m.content for m in reversed(messages) if m.role == "user"), "")
+                if user_input:
+                    root_span._otel_span.set_attribute("input.value", user_input[:8192])  # type: ignore[attr-defined]
+
                 prepare_span = telemetry_manager.start_span(
                     run,
                     name="prepare.prompt",
@@ -369,9 +385,15 @@ class AgentRuntime:
                 instructions = self._prompt(profile)
                 input_items = self._conversation_input(messages)
 
+                # Build a label→server map for peer.service attribution on tool spans.
+                server_by_label: dict[str, MCPServer] = {
+                    re.sub(r"[^a-zA-Z0-9_-]", "_", s.name)[:64]: s
+                    for s in [*auto_servers, *prompt_servers]
+                }
+
                 model_span = telemetry_manager.start_span(
                     run,
-                    name="model.call",
+                    name="gen_ai.chat",
                     kind="model",
                     parent_otel_span=root_span._otel_span,  # type: ignore[attr-defined]
                     attributes={
@@ -381,6 +403,11 @@ class AgentRuntime:
                     },
                 )
                 model_otel = model_span._otel_span  # type: ignore[attr-defined]
+
+                model_otel.set_attribute("input.value", json.dumps({
+                    "system": instructions,
+                    "messages": input_items,
+                })[:8192])
 
                 # Record the full conversation as OTEL span events (gen_ai semantic conventions).
                 model_otel.add_event("gen_ai.system.message", attributes={"gen_ai.prompt": instructions[:8192]})
@@ -412,22 +439,78 @@ class AgentRuntime:
                 )
 
                 streamed_output_text = ""
+                had_tool_calls = False
+                active_tool_spans: dict[str, ActiveSpan] = {}
                 queued_events: asyncio.Queue[str] = asyncio.Queue()
 
                 async def on_stream_event(stream_event: dict[str, Any]) -> None:
-                    nonlocal streamed_output_text
+                    nonlocal streamed_output_text, had_tool_calls
                     event_type = str(stream_event.get("type", ""))
 
-                    # Record completed output items as OTEL span events.
+                    # Pattern A: start a child span when a tool call item begins.
+                    if event_type == "response.output_item.added":
+                        item = stream_event.get("item") or {}
+                        item_type = item.get("type", "")
+                        item_id = str(item.get("id", ""))
+                        if item_type in ("mcp_call", "function_call") and item_id:
+                            had_tool_calls = True
+                            server_label = str(item.get("server_label", ""))
+                            tool_name = str(item.get("name", "unknown"))
+                            call_id = str(item.get("call_id") or item.get("id", ""))
+                            server = server_by_label.get(server_label)
+                            tool_attrs: dict[str, Any] = {
+                                "gen_ai.tool.name": tool_name,
+                                "gen_ai.tool.call.id": call_id,
+                                "tool.name": tool_name,
+                                "tool.server": server_label,
+                                "peer.service": server_label,
+                            }
+                            if server and server.server_url:
+                                parsed = urlparse(server.server_url)
+                                if parsed.hostname:
+                                    tool_attrs["server.address"] = parsed.hostname
+                                if parsed.port:
+                                    tool_attrs["server.port"] = parsed.port
+                            tool_span = telemetry_manager.start_span(
+                                run,
+                                name="gen_ai.tool.call",
+                                kind="tool",
+                                parent_otel_span=model_otel,
+                                attributes=tool_attrs,
+                            )
+                            active_tool_spans[item_id] = tool_span
+                        return
+
+                    # Record completed output items; end tool.call child span if one is active.
                     if event_type == "response.output_item.done":
                         item = stream_event.get("item") or {}
+                        item_type = item.get("type", "")
+                        item_id = str(item.get("id", ""))
+
+                        if item_id in active_tool_spans:
+                            tool_span = active_tool_spans.pop(item_id)
+                            tool_otel = tool_span._otel_span  # type: ignore[attr-defined]
+                            tool_input = item.get("input") or item.get("arguments")
+                            if tool_input:
+                                raw = tool_input if isinstance(tool_input, str) else json.dumps(tool_input)
+                                tool_otel.set_attribute("gen_ai.tool.args", raw[:8192])
+                                tool_otel.set_attribute("input.value", raw[:8192])
+                            tool_output = item.get("output")
+                            if tool_output:
+                                raw = tool_output if isinstance(tool_output, str) else json.dumps(tool_output)
+                                tool_otel.set_attribute("gen_ai.tool.result", raw[:8192])
+                                tool_otel.set_attribute("output.value", raw[:8192])
+                            telemetry_manager.end_span(tool_span)
+
+                        # Always record the output_item event on the parent span.
+                        # Tool call items also have dedicated child spans (Pattern A)
+                        # for OTEL consumers; the event here serves the frontend
+                        # persistence layer (persistedDetailedActivity).
                         item_attrs: dict[str, str] = {
                             "item.type": str(item.get("type", "")),
-                            "item.id": str(item.get("id", "")),
+                            "item.id": item_id,
                             "content": json.dumps(item)[:65536],
                         }
-                        # Store text separately so the frontend can recover it even if the
-                        # full JSON is truncated (long invoice / report responses).
                         if item.get("type") == "message":
                             content_list = item.get("content", [])
                             if isinstance(content_list, list):
@@ -517,22 +600,47 @@ class AgentRuntime:
                         model_call.cancel()
 
                 output_text = self._response_text_from_payload(response) or streamed_output_text
+                # Always record the raw output items so we can compare against what
+                # _response_text_from_payload extracted. Stored as a span event so it
+                # lands in Postgres alongside the processed data.
+                raw_output = response.get("output", [])
+                model_otel.add_event("llm.raw_output", attributes={
+                    "output_item_count": len(raw_output) if isinstance(raw_output, list) else 0,
+                    "output_item_types": json.dumps([i.get("type") for i in raw_output if isinstance(i, dict)])[:1024],
+                    "raw_output": json.dumps(raw_output)[:65536],
+                })
+                if settings.log_llm_traffic:
+                    logger.debug("[LLM PARSED] extracted_text=%r output_item_count=%d item_types=%s",
+                                 output_text[:500] if output_text else None,
+                                 len(raw_output) if isinstance(raw_output, list) else 0,
+                                 [i.get("type") for i in raw_output if isinstance(i, dict)])
+                if output_text:
+                    model_otel.set_attribute("output.value", output_text[:8192])
+                    root_span._otel_span.set_attribute("output.value", output_text[:8192])  # type: ignore[attr-defined]
                 usage_payload = self._response_usage_payload(response)
                 response_id = response.get("id")
+                response_model = response.get("model", profile.model_name)
+                finish_reason = "tool_calls" if had_tool_calls else "stop"
 
-                # Set token usage as OTEL attributes and record the completion event.
+                # Set token usage and response metadata as OTEL attributes.
                 if usage_payload.get("input_tokens") is not None:
                     model_otel.set_attribute("gen_ai.usage.input_tokens", int(usage_payload["input_tokens"]))
                 if usage_payload.get("output_tokens") is not None:
                     model_otel.set_attribute("gen_ai.usage.output_tokens", int(usage_payload["output_tokens"]))
                 if usage_payload.get("total_tokens") is not None:
                     model_otel.set_attribute("gen_ai.usage.total_tokens", int(usage_payload["total_tokens"]))
-                if output_text:
-                    model_otel.add_event("gen_ai.choice", attributes={
-                        "gen_ai.completion": output_text[:65536],
-                        "finish_reason": "stop",
-                        "used_mcp_fallback": used_mcp_fallback,
-                    })
+                if response_id:
+                    model_otel.set_attribute("gen_ai.response.id", response_id)
+                model_otel.set_attribute("gen_ai.response.model", response_model)
+                model_otel.set_attribute("gen_ai.response.finish_reasons", finish_reason)
+                model_otel.add_event("gen_ai.choice", attributes={
+                    "index": 0,
+                    "finish_reason": finish_reason,
+                    "message.role": "assistant",
+                    "message.content": output_text[:65536] if output_text else "",
+                    "gen_ai.completion": output_text[:65536] if output_text else "",
+                    "used_mcp_fallback": used_mcp_fallback,
+                })
 
                 model_span_ended = True
                 telemetry_manager.end_span(model_span)
@@ -582,7 +690,11 @@ class AgentRuntime:
                 failed_span = (model_span if model_span and not model_span_ended else None) or root_span
                 failed_otel = getattr(failed_span, "_otel_span", None)
                 if failed_otel:
-                    failed_otel.add_event("run.failed", attributes={"error": error_message, "error_type": exc.__class__.__name__})
+                    failed_otel.set_attribute("error.type", exc.__class__.__name__)
+                    failed_otel.add_event("gen_ai.error", attributes={
+                        "error.type": exc.__class__.__name__,
+                        "error.message": error_message[:2048],
+                    })
                 telemetry_manager.end_span(failed_span, status="failed")
                 if failed_span is not root_span:
                     telemetry_manager.close_otel_span(root_span, status="failed")

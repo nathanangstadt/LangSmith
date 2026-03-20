@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -93,20 +94,23 @@ def get_config() -> dict[str, bool | str]:
     from app.config import get_settings as _get_settings
     s = _get_settings()
     return {
-        "langsmith_enabled": s.langsmith_tracing and bool(s.langsmith_api_key),
-        "langsmith_project": s.langsmith_project,
-        "otel_enabled": bool(s.otel_exporter_otlp_endpoint),
+        "langsmith_available": s.langsmith_enabled,
+        "langsmith_url": s.langsmith_project_url,
+        "otel_available": bool(s.otel_exporter_otlp_endpoint),
         "otel_endpoint": s.otel_exporter_otlp_endpoint or "",
-        "otel_export_active": telemetry_manager.otel_export_active,
+        "export_mode": telemetry_manager.export_mode,
         "jaeger_ui_url": s.jaeger_ui_url,
         "openai_configured": bool(s.openai_api_key),
     }
 
 
-@router.post("/otel/toggle")
-def toggle_otel_export() -> dict[str, bool]:
-    telemetry_manager.otel_export_active = not telemetry_manager.otel_export_active
-    return {"otel_export_active": telemetry_manager.otel_export_active}
+@router.post("/export/mode")
+def set_export_mode(payload: dict[str, str]) -> dict[str, str]:
+    mode = payload.get("mode", "none")
+    if mode not in ("none", "langsmith", "otel"):
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {mode!r}")
+    telemetry_manager.export_mode = mode  # type: ignore[assignment]
+    return {"export_mode": telemetry_manager.export_mode}
 
 
 @router.post("/llm-connections")
@@ -538,8 +542,28 @@ def resolve_approval(
     approval.rationale = payload.rationale
     if payload.status == "denied":
         run.status = "failed"
+    resolved_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(run)
+
+    # Record a retroactive approval.wait span with accurate timestamps and a
+    # span link back to the original gen_ai.agent.invoke span.
+    original_span = (
+        db.query(OtelSpan)
+        .filter(OtelSpan.run_id == run_id, OtelSpan.name == "gen_ai.agent.invoke")
+        .order_by(OtelSpan.start_time_unix_nano)
+        .first()
+    )
+    telemetry_manager.record_approval_span(
+        run_id=run_id,
+        approval_id=approval_id,
+        server_name=str(approval.metadata_json.get("server_name", "")),
+        outcome=payload.status,
+        requested_at=approval.created_at,
+        resolved_at=resolved_at,
+        link_trace_id=original_span.trace_id if original_span else None,
+        link_span_id=original_span.span_id if original_span else None,
+    )
     return {"run": {"id": run.id, "status": run.status}}
 
 
@@ -557,12 +581,12 @@ def resume_run_stream(run_id: str, db: Session = Depends(get_db)) -> StreamingRe
     if pending > 0:
         raise HTTPException(status_code=409, detail=f"Run has {pending} pending approval(s)")
 
-    # Reconstruct the original react.run span as a non-recording parent so that
-    # react.resume appears as a child in the same Jaeger trace.
+    # Reconstruct the original gen_ai.agent.invoke span as a non-recording parent so that
+    # the resumed invocation appears as a child in the same trace.
     parent_otel_span = None
     original_span = (
         db.query(OtelSpan)
-        .filter(OtelSpan.run_id == run_id, OtelSpan.name == "react.run")
+        .filter(OtelSpan.run_id == run_id, OtelSpan.name == "gen_ai.agent.invoke")
         .order_by(OtelSpan.start_time_unix_nano)
         .first()
     )
@@ -579,7 +603,7 @@ def resume_run_stream(run_id: str, db: Session = Depends(get_db)) -> StreamingRe
             pass
 
     return StreamingResponse(
-        agent_runtime.stream_run(run_id, root_span_name="react.resume", parent_otel_span=parent_otel_span),
+        agent_runtime.stream_run(run_id, parent_otel_span=parent_otel_span),
         media_type="text/event-stream",
     )
 

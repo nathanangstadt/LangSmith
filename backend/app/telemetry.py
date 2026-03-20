@@ -3,7 +3,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -15,7 +15,7 @@ from opentelemetry.sdk.trace.export import (
     SpanExporter,
     SpanExportResult,
 )
-from opentelemetry.trace import SpanKind, StatusCode
+from opentelemetry.trace import Link, SpanContext, SpanKind, StatusCode, TraceFlags
 
 from app.config import get_settings
 from app.database import db_context
@@ -23,6 +23,10 @@ from app.models import OtelSpan
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+ExportMode = Literal["none", "langsmith", "otel"]
+
+_LANGSMITH_OTLP_ENDPOINT = "https://api.smith.langchain.com/otel/v1/traces"
 
 
 def _parse_headers(value: str | None) -> dict[str, str]:
@@ -98,10 +102,10 @@ class GatedOTLPExporter(SpanExporter):
     the toggle endpoint request thread, so access is guarded by a lock.
     """
 
-    def __init__(self, inner: OTLPSpanExporter) -> None:
+    def __init__(self, inner: OTLPSpanExporter, initial_active: bool = False) -> None:
         self._inner = inner
         self._lock = threading.Lock()
-        self._active: bool = True
+        self._active: bool = initial_active
 
     @property
     def active(self) -> bool:
@@ -124,21 +128,41 @@ class GatedOTLPExporter(SpanExporter):
 
 # Always create a TracerProvider. Register the Postgres exporter with a
 # SimpleSpanProcessor (synchronous) so spans land in the DB before the next
-# SSE event is emitted. Add the OTLP BatchSpanProcessor only when an endpoint
-# is configured — gated so export can be toggled at runtime without restart.
+# SSE event is emitted. Register gated OTLP exporters for each configured
+# destination — only one will be active at a time, controlled by export_mode.
 _resource = Resource.create({"service.name": settings.otel_service_name})
 _provider = TracerProvider(resource=_resource)
 _provider.add_span_processor(SimpleSpanProcessor(PostgresSpanExporter()))
 
-_gated_exporter: GatedOTLPExporter | None = None
+_langsmith_exporter: GatedOTLPExporter | None = None
+if settings.langsmith_enabled:
+    _headers = f"x-api-key={settings.langsmith_api_key}"
+    if settings.langsmith_project:
+        _headers += f",x-langsmith-project={settings.langsmith_project}"
+    _langsmith_exporter = GatedOTLPExporter(
+        OTLPSpanExporter(
+            endpoint=_LANGSMITH_OTLP_ENDPOINT,
+            headers=_parse_headers(_headers),
+        )
+    )
+    _provider.add_span_processor(BatchSpanProcessor(_langsmith_exporter))
+
+_otel_exporter: GatedOTLPExporter | None = None
 if settings.otel_exporter_otlp_endpoint:
-    _gated_exporter = GatedOTLPExporter(
+    _otel_exporter = GatedOTLPExporter(
         OTLPSpanExporter(
             endpoint=settings.otel_exporter_otlp_endpoint,
             headers=_parse_headers(settings.otel_exporter_otlp_headers),
         )
     )
-    _provider.add_span_processor(BatchSpanProcessor(_gated_exporter))
+    _provider.add_span_processor(BatchSpanProcessor(_otel_exporter))
+
+# Set initial export mode: prefer langsmith, then otel, then none.
+if _langsmith_exporter is not None:
+    _langsmith_exporter.active = True
+elif _otel_exporter is not None:
+    _otel_exporter.active = True
+
 trace.set_tracer_provider(_provider)
 
 otel_tracer = trace.get_tracer("agent_playground")
@@ -153,13 +177,19 @@ class ActiveSpan:
 
 class TelemetryManager:
     @property
-    def otel_export_active(self) -> bool:
-        return _gated_exporter.active if _gated_exporter is not None else False
+    def export_mode(self) -> ExportMode:
+        if _langsmith_exporter is not None and _langsmith_exporter.active:
+            return "langsmith"
+        if _otel_exporter is not None and _otel_exporter.active:
+            return "otel"
+        return "none"
 
-    @otel_export_active.setter
-    def otel_export_active(self, value: bool) -> None:
-        if _gated_exporter is not None:
-            _gated_exporter.active = value
+    @export_mode.setter
+    def export_mode(self, mode: ExportMode) -> None:
+        if _langsmith_exporter is not None:
+            _langsmith_exporter.active = (mode == "langsmith")
+        if _otel_exporter is not None:
+            _otel_exporter.active = (mode == "otel")
 
     def start_span(
         self,
@@ -169,7 +199,7 @@ class TelemetryManager:
         parent_otel_span: Any | None = None,
         attributes: dict[str, Any] | None = None,
     ) -> ActiveSpan:
-        otel_kind = SpanKind.CLIENT if kind == "model" else SpanKind.INTERNAL
+        otel_kind = SpanKind.CLIENT if kind in ("model", "tool") else SpanKind.INTERNAL
         parent_ctx = trace.set_span_in_context(parent_otel_span) if parent_otel_span else None
         otel_span = otel_tracer.start_span(name, context=parent_ctx, kind=otel_kind)
 
@@ -200,6 +230,51 @@ class TelemetryManager:
             trace.Status(StatusCode.ERROR if status == "failed" else StatusCode.OK)
         )
         otel_span.end()  # triggers PostgresSpanExporter synchronously
+
+    def record_approval_span(
+        self,
+        run_id: str,
+        approval_id: str,
+        server_name: str,
+        outcome: str,
+        requested_at: datetime,
+        resolved_at: datetime,
+        link_trace_id: str | None = None,
+        link_span_id: str | None = None,
+    ) -> None:
+        """Create a retroactive gen_ai.approval.wait span with accurate timestamps.
+
+        Called at resolution time so no span stays open during the wait period.
+        A span link back to gen_ai.agent.invoke preserves the causal relationship
+        without requiring the root span to remain open across HTTP requests.
+        """
+        start_ns = int(requested_at.timestamp() * 1_000_000_000)
+        end_ns = int(resolved_at.timestamp() * 1_000_000_000)
+        links: list[Link] = []
+        if link_trace_id and link_span_id:
+            try:
+                link_ctx = SpanContext(
+                    trace_id=int(link_trace_id, 16),
+                    span_id=int(link_span_id, 16),
+                    is_remote=True,
+                    trace_flags=TraceFlags(TraceFlags.SAMPLED),
+                )
+                links.append(Link(link_ctx))
+            except ValueError:
+                pass
+        span = otel_tracer.start_span(
+            "gen_ai.approval.wait",
+            start_time=start_ns,
+            links=links,
+            kind=SpanKind.INTERNAL,
+        )
+        span.set_attribute("agent.run_id", run_id)
+        span.set_attribute("approval.id", approval_id)
+        span.set_attribute("approval.server", server_name)
+        span.set_attribute("approval.outcome", outcome)
+        span.set_attribute("approval.wait_ms", max(0, (end_ns - start_ns) // 1_000_000))
+        span.set_status(trace.Status(StatusCode.ERROR if outcome == "denied" else StatusCode.OK))
+        span.end(end_time=end_ns)
 
     def close_otel_span(self, span: ActiveSpan, *, status: str = "failed") -> None:
         """End the OTEL span (writes to DB) without the model-specific gen_ai

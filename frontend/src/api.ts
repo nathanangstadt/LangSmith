@@ -18,8 +18,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  getConfig: () => request<{ langsmith_enabled: boolean; langsmith_project: string; otel_enabled: boolean; otel_endpoint: string; otel_export_active: boolean; jaeger_ui_url: string; openai_configured: boolean }>("/config"),
-  toggleOtelExport: () => request<{ otel_export_active: boolean }>("/otel/toggle", { method: "POST" }),
+  getConfig: () => request<{ langsmith_available: boolean; langsmith_url: string; otel_available: boolean; otel_endpoint: string; export_mode: "none" | "langsmith" | "otel"; jaeger_ui_url: string; openai_configured: boolean }>("/config"),
+  setExportMode: (mode: "none" | "langsmith" | "otel") => request<{ export_mode: "none" | "langsmith" | "otel" }>("/export/mode", { method: "POST", body: JSON.stringify({ mode }) }),
   listProfiles: () => request<AgentProfile[]>("/agent-profiles"),
   cloneProfile: (profileId: string) => request<AgentProfile>(`/agent-profiles/${profileId}/clone`, { method: "POST" }),
   deleteProfile: (profileId: string) => request<{ ok: boolean }>(`/agent-profiles/${profileId}`, { method: "DELETE" }),

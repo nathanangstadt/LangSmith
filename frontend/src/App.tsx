@@ -84,7 +84,7 @@ export default function App() {
   const [serverTestState, setServerTestState] = useState<ServerTestState>({ status: "idle", message: "", tools: [] });
   const [liveDetailedActivity, setLiveDetailedActivity] = useState<DetailedActivityItem[]>([]);
   const [traceModalOpen, setTraceModalOpen] = useState(false);
-  const [backendConfig, setBackendConfig] = useState<{ langsmith_enabled: boolean; langsmith_project: string; otel_enabled: boolean; otel_endpoint: string; otel_export_active: boolean; jaeger_ui_url: string; openai_configured: boolean } | null>(null);
+  const [backendConfig, setBackendConfig] = useState<{ langsmith_available: boolean; langsmith_url: string; otel_available: boolean; otel_endpoint: string; export_mode: "none" | "langsmith" | "otel"; jaeger_ui_url: string; openai_configured: boolean } | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -442,8 +442,10 @@ export default function App() {
 
   const spanVisual = (name: string, attrs: Record<string, unknown>, durationMs: number | null) => {
     const dur = durationMs != null ? (durationMs >= 1000 ? `~${(durationMs / 1000).toFixed(1)}s` : `~${durationMs}ms`) : "";
-    if (name === "react.run") return { bg: "#3b2d7e", subtitle: `Root span · ${dur} total` };
-    if (name === "model.call") return { bg: "#7a4a18", subtitle: `${String(attrs["gen_ai.request.model"] ?? "")} · ${dur}` };
+    if (name === "gen_ai.agent.invoke") return { bg: "#3b2d7e", subtitle: `Root span · ${dur} total` };
+    if (name === "gen_ai.chat") return { bg: "#7a4a18", subtitle: `${String(attrs["gen_ai.request.model"] ?? "")} · ${dur}` };
+    if (name === "gen_ai.tool.call") return { bg: "#4a3a6a", subtitle: `${String(attrs["gen_ai.tool.name"] ?? "")} · ${dur}` };
+    if (name === "gen_ai.approval.wait") return { bg: "#5c3a1a", subtitle: `${String(attrs["approval.server"] ?? "")} · ${dur}` };
     if (name === "prepare.prompt") return { bg: "#1a5c4a", subtitle: `${String(attrs["agent.message_count"] ?? "?")} message` };
     if (name === "final.answer") return { bg: "#1a5c4a", subtitle: "Summary output" };
     return { bg: "#2a4258", subtitle: name };
@@ -1548,41 +1550,55 @@ export default function App() {
           <div className="panel-header telemetry-header">
             <h2>Telemetry</h2>
             <div className="row-actions telemetry-actions">
-              <span className="badge" title="Telemetry is always stored in this app's local Postgres database.">Local</span>
-              <span
-                className={backendConfig?.langsmith_enabled ? "badge" : "badge badge--inactive"}
-                title={backendConfig?.langsmith_enabled
-                  ? `Exporting to LangSmith project "${backendConfig.langsmith_project}". Set LANGSMITH_TRACING=true and LANGSMITH_API_KEY to configure.`
-                  : "LangSmith export is off. Set LANGSMITH_TRACING=true and LANGSMITH_API_KEY in .env to enable."}
-              >LangSmith</span>
-              <button
-                className={
-                  !backendConfig?.otel_enabled
-                    ? "badge badge--inactive badge--button"
-                    : backendConfig.otel_export_active
-                      ? "badge badge--button badge--otel-on"
-                      : "badge badge--inactive badge--button"
-                }
-                disabled={!backendConfig?.otel_enabled}
-                title={
-                  !backendConfig?.otel_enabled
-                    ? "OTEL export is off. Set OTEL_EXPORTER_OTLP_ENDPOINT in .env to enable."
-                    : backendConfig.otel_export_active
-                      ? `Exporting spans to ${backendConfig.otel_endpoint} — click to stop`
-                      : `OTEL configured (${backendConfig.otel_endpoint}) — click to start exporting`
-                }
-                onClick={() => {
-                  if (!backendConfig?.otel_enabled) return;
-                  api.toggleOtelExport().then((res) => {
-                    setBackendConfig((c) => c ? { ...c, otel_export_active: res.otel_export_active } : c);
-                  }).catch(() => {});
-                }}
-              >
-                OTEL{backendConfig?.otel_enabled && (
-                  <span className={`otel-indicator ${backendConfig.otel_export_active ? "otel-indicator--on" : "otel-indicator--off"}`} />
-                )}
-              </button>
-              {backendConfig?.otel_enabled && backendConfig.jaeger_ui_url && (
+              <span className="badge badge--otel-on" title="Telemetry is always stored in this app's local Postgres database.">Local<span className="otel-indicator otel-indicator--on" /></span>
+              {(() => {
+                if (!backendConfig) return null;
+                const { langsmith_available, otel_available, export_mode } = backendConfig;
+                const available: ("none" | "langsmith" | "otel")[] = [
+                  "none",
+                  ...(langsmith_available ? ["langsmith" as const] : []),
+                  ...(otel_available ? ["otel" as const] : []),
+                ];
+                const nextMode = available[(available.indexOf(export_mode) + 1) % available.length];
+                const isExporting = export_mode !== "none";
+
+                const label = export_mode === "langsmith" ? "LangSmith"
+                  : export_mode === "otel" ? "OTEL"
+                  : "Export: Off";
+                const title = export_mode === "langsmith"
+                  ? `Exporting to LangSmith — click to change`
+                  : export_mode === "otel"
+                    ? `Exporting to ${backendConfig.otel_endpoint} — click to change`
+                    : available.length > 1
+                      ? "Export off — click to enable"
+                      : "No export destinations configured. Set LANGSMITH_TRACING or OTEL_EXPORTER_OTLP_ENDPOINT in .env.";
+
+                return (
+                  <button
+                    className={isExporting ? "badge badge--button badge--otel-on" : "badge badge--inactive badge--button"}
+                    disabled={available.length === 1}
+                    title={title}
+                    onClick={() => {
+                      api.setExportMode(nextMode).then((res) => {
+                        setBackendConfig((c) => c ? { ...c, export_mode: res.export_mode } : c);
+                      }).catch(() => {});
+                    }}
+                  >
+                    {label}
+                    {isExporting && <span className="otel-indicator otel-indicator--on" />}
+                  </button>
+                );
+              })()}
+              {backendConfig?.langsmith_available && backendConfig.langsmith_url && (
+                <a
+                  href={backendConfig.langsmith_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="badge badge--button"
+                  title="Open LangSmith"
+                >LangSmith ↗</a>
+              )}
+              {backendConfig?.otel_available && backendConfig.jaeger_ui_url && (
                 <a
                   href={backendConfig.jaeger_ui_url}
                   target="_blank"
@@ -1662,7 +1678,7 @@ export default function App() {
 
       {traceModalOpen && telemetry && (() => {
         const root = buildSpanTree(telemetry.spans);
-        const modelSpan = telemetry.spans.find((s) => s.name === "model.call");
+        const modelSpan = telemetry.spans.find((s) => s.name === "gen_ai.chat");
         const traceEvents = modelSpan ? parseTraceEvents(modelSpan) : [];
         const inTok = modelSpan?.attributes["gen_ai.usage.input_tokens"];
         const outTok = modelSpan?.attributes["gen_ai.usage.output_tokens"];

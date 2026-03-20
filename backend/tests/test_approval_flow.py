@@ -295,7 +295,7 @@ def test_auto_server_skips_approval_gate(mock_tm, _mock_tool, fx, db):
 
 # ---------------------------------------------------------------------------
 # Integration tests: approved server uses require_approval="never" and
-# the resume path uses the react.resume span name
+# the resume path uses gen_ai.agent.invoke as the root span name
 # ---------------------------------------------------------------------------
 
 @patch("app.runtime.build_openai_mcp_tool", new_callable=AsyncMock, return_value=FAKE_MCP_TOOL)
@@ -332,9 +332,8 @@ def test_approved_server_built_with_require_approval_never(mock_tm, mock_tool, f
 
 @patch("app.runtime.build_openai_mcp_tool", new_callable=AsyncMock, return_value=FAKE_MCP_TOOL)
 @patch("app.runtime.telemetry_manager")
-def test_resume_uses_react_resume_span(mock_tm, _mock_tool, fx, db):
-    """stream_run called with root_span_name='react.resume' must use that name
-    for the root span, so the telemetry does not show a second 'react.run' node."""
+def test_resume_uses_agent_invoke_span(mock_tm, _mock_tool, fx, db):
+    """Resumed stream_run must use gen_ai.agent.invoke as the root span name."""
     mock_tm.start_span.side_effect = stub_start_span
 
     db.add(ApprovalDecision(
@@ -351,11 +350,11 @@ def test_resume_uses_react_resume_span(mock_tm, _mock_tool, fx, db):
         raise RuntimeError("SENTINEL")
 
     with patch.object(runtime, "_call_openai_with_mcp_fallback", side_effect=raise_sentinel):
-        collect_sse(runtime.stream_run(fx.run.id, root_span_name="react.resume"))
+        collect_sse(runtime.stream_run(fx.run.id))
 
     # First start_span call is the root span.
     first_call = mock_tm.start_span.call_args_list[0]
     span_name = first_call.kwargs.get("name") or first_call.args[1]
-    assert span_name == "react.resume", (
-        f"Expected root span name 'react.resume', got '{span_name}'."
+    assert span_name == "gen_ai.agent.invoke", (
+        f"Expected root span name 'gen_ai.agent.invoke', got '{span_name}'."
     )

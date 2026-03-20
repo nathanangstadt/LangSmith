@@ -30,9 +30,19 @@ class Settings(BaseSettings):
     otel_service_name: str = Field(default="agent-playground", alias="OTEL_SERVICE_NAME")
     jaeger_ui_url: str = Field(default="", alias="JAEGER_UI_URL")
     frontend_origin: str = Field(default="http://localhost:5173", alias="FRONTEND_ORIGIN")
+    log_llm_traffic: bool = Field(default=False, alias="LOG_LLM_TRAFFIC")
+
+    @property
+    def langsmith_enabled(self) -> bool:
+        return self.langsmith_tracing and bool(self.langsmith_api_key)
+
+    @property
+    def langsmith_project_url(self) -> str:
+        if not self.langsmith_enabled:
+            return ""
+        return "https://smith.langchain.com/"
 
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

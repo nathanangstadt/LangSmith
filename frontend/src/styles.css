@@ -561,6 +561,7 @@ button.list-item {
   height: 6px;
   border-radius: 50%;
   flex-shrink: 0;
+  margin-left: 5px;
 }
 
 .otel-indicator--on {
@@ -618,12 +619,17 @@ button.list-item {
 }
 
 .telemetry-header {
-  flex-wrap: nowrap;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.telemetry-header h2 {
+  margin: 0;
 }
 
 .telemetry-actions {
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 0.4rem;
 }
 
